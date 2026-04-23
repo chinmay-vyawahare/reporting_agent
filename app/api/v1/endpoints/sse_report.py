@@ -94,16 +94,8 @@ def _run_stream_thread(
         elapsed_ms = (time.perf_counter() - start_time) * 1000
 
         if result["status"] == "success":
-            db_service.update_query_complete(
-                query_id=query_id,
-                charts=result.get("charts", []),
-                rationale=result.get("rationale", ""),
-                traversal_findings=result.get("traversal_findings", ""),
-                traversal_steps=result.get("traversal_steps", 0),
-                duration_ms=elapsed_ms,
-                errors=result.get("errors"),
-                evidence=result.get("evidence", []),
-            )
+            # Persistence already done by stream_report before emit (so the
+            # SSE client never races the DB write).
             print(f"\n{_BOLD}{'=' * 70}", flush=True)
             print(f"  {_GREEN}SUCCESS — {len(result.get('charts', []))} chart(s) in {elapsed_ms:.0f}ms{_RESET}", flush=True)
             print(f"{_BOLD}{'=' * 70}{_RESET}\n", flush=True)

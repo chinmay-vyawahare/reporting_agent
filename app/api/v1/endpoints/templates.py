@@ -26,10 +26,10 @@ from services import db_service
 from services.insight_refresh import refresh_insight
 from tools.python_sandbox import PythonSandbox
 from agents.graph_agent import _round_floats
-# Re-use the canvas slot example + ChartFromReport so a slot and a template
-# selection look identical in the docs (they ARE identical — a template
-# selection is a finalized canvas slot).
-from api.v1.endpoints.canvas import ChartFromReport, _EXAMPLE_CHART, _EXAMPLE_SLOT
+# Re-use the canvas slot example so the docs show one consistent shape.
+# `Chart` is the strict per-type discriminated union from models.chart_types.
+from models.chart_types import Chart
+from api.v1.endpoints.canvas import _EXAMPLE_CHART, _EXAMPLE_SLOT  # noqa: F401 (kept for reference)
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +55,7 @@ class TemplateSelectionIn(BaseModel):
     Optional: `original_query`, layout (`x` / `y` / `w` / `h` / `position`).
     """
     query_id: str = Field(..., description="From SSE stream_started.query_id")
-    chart:    ChartFromReport = Field(..., description="Full chart object from /report/stream complete.charts[i] — includes chart_id, script, insight, colors, etc.")
+    chart:    Chart = Field(..., description="Full chart object — strict per-type schema (cartesian or pie). chart_id, script, insight, colors are required.")
 
     original_query: str = Field(default="", description="The NL question that produced the chart")
 
@@ -228,15 +228,37 @@ def list_thread_queries(thread_id: str, limit: int = Query(default=100, le=500))
 
 # ── Templates (4 endpoints, no extras) ──────────────────────────────────────
 
+def _selection_specs(selections: list) -> list[dict]:
+    """Convert validated `TemplateSelectionIn` objects into the dict shape
+    `db_service.replace_template_selections` consumes.
+
+    The chart object inside each selection MUST already have its `chart_id`
+    pointing at a row in `reporting_agent_charts` (the canvas-flow saves the
+    cloned chart there before it gets here).
+    """
+    out: list[dict] = []
+    for i, s in enumerate(selections):
+        d = s.model_dump()
+        chart_obj = d.get("chart") or {}
+        cid = chart_obj.get("chart_id")
+        if not cid:
+            raise HTTPException(status_code=422, detail="selection.chart.chart_id is required")
+        out.append({
+            "chart_id":       cid,
+            "query_id":       d.get("query_id") or "",
+            "original_query": d.get("original_query") or "",
+            "x":        int(d.get("x") or 0),
+            "y":        int(d.get("y") or 0),
+            "w":        int(d.get("w") or 6),
+            "h":        int(d.get("h") or 4),
+            "position": int(d.get("position") if d.get("position") is not None else i),
+        })
+    return out
+
+
 @router.post("/templates", summary="Create OR update (upsert by source_draft_id) a template")
 def create_template(payload: TemplateIn):
-    """Save the canvas as a template.
-
-    If `source_draft_id` is provided AND a template already exists for that
-    draft, the existing template is **updated in place** — clicking "Save to
-    template" twice from the same canvas never produces duplicates. Without
-    `source_draft_id`, always creates a fresh template.
-    """
+    """Save the canvas as a template. Upsert by `source_draft_id`."""
     if not payload.selections:
         raise HTTPException(status_code=400, detail="At least one chart selection is required.")
     if len(payload.selections) > MAX_CHARTS_PER_TEMPLATE:
@@ -245,43 +267,49 @@ def create_template(payload: TemplateIn):
             detail=f"Max {MAX_CHARTS_PER_TEMPLATE} charts per template, got {len(payload.selections)}.",
         )
 
-    selections    = [s.dict() for s in payload.selections]
-    last_rendered = {"charts": [s["chart"] for s in selections]}
-    title         = payload.title.strip() or "Untitled report"
+    title       = payload.title.strip() or "Untitled report"
+    sel_specs   = _selection_specs(payload.selections)
 
-    # Upsert by source_draft_id: re-saving the same canvas updates instead
-    # of duplicating. Without source_draft_id this branch is skipped.
+    # Upsert by source_draft_id — same draft-to-template never duplicates.
     if payload.source_draft_id:
         existing = db_service.find_template_by_draft(payload.source_draft_id)
         if existing:
             template_id = existing["template_id"]
-            db_service.update_template(
+            db_service.update_template_meta(
                 template_id=template_id,
                 title=title,
                 project_type=payload.project_type,
-                selections=selections,
-                last_rendered=last_rendered,
                 source_draft_id=payload.source_draft_id,
             )
+            db_service.replace_template_selections(template_id, sel_specs)
             return {"template_id": template_id, "action": "updated"}
 
     template_id = str(uuid.uuid4())
     db_service.create_template(
         template_id=template_id,
         user_id=payload.user_id,
-        thread_id=None,
         title=title,
         project_type=payload.project_type,
-        selections=selections,
-        last_rendered=last_rendered,
         source_draft_id=payload.source_draft_id,
     )
+    db_service.replace_template_selections(template_id, sel_specs)
     return {"template_id": template_id, "action": "created"}
 
 
-@router.get("/templates", summary="List a user's templates")
+@router.get("/templates", summary="List a user's templates (metadata only — no selections inlined)")
 def list_templates(user_id: str = Query(...), limit: int = Query(default=50, le=200)):
     return {"templates": db_service.get_templates_by_user(user_id, limit=limit)}
+
+
+@router.get("/templates/{template_id}", summary="Fetch one template, with its selections inlined")
+def get_template(template_id: str):
+    """Returns the template plus every selection (with the chart fully
+    reconstructed from `reporting_agent_charts`). Use this when opening a
+    template view; the list endpoint is metadata-only for cheap listing."""
+    row = db_service.get_template(template_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Template not found")
+    return row
 
 
 @router.delete("/templates/{template_id}", summary="Delete a template")
@@ -299,13 +327,8 @@ def run_template(template_id: str):
     if not row:
         raise HTTPException(status_code=404, detail="Template not found")
 
+    # Selections come as proper rows from the dedicated table — no JSONB parse.
     selections = row.get("selections") or []
-    if isinstance(selections, str):
-        try:
-            selections = json.loads(selections)
-        except Exception:
-            selections = []
-
     sandbox = PythonSandbox()
     rendered_selections: list[dict[str, Any]] = []
     script_reports: list[dict[str, Any]] = []
@@ -352,6 +375,18 @@ def run_template(template_id: str):
             sub["text"] = ((sub.get("text", "") or "") + "  (refresh failed — showing saved data)").strip()
             new_chart["subtitle"] = sub
 
+        # Validate the rebuilt chart against the strict per-type Chart union
+        # before returning. If reshape produced something off-shape, log it
+        # but still return — the UI's Chart-typed parser will catch it too.
+        try:
+            from models.chart_types import parse_chart as _parse_chart
+            _parse_chart(new_chart)
+        except Exception as ve:
+            logger.warning(
+                "rebuilt chart failed Chart validation (chart_id=%s): %s",
+                new_chart.get("chart_id"), ve,
+            )
+
         # Return the WHOLE selection back so the UI can render in the same
         # spot it was saved. Layout (x/y/w/h/position) is carried verbatim
         # from the saved selection — only `chart` is the freshly rebuilt one.
@@ -367,12 +402,14 @@ def run_template(template_id: str):
             "chart":          new_chart,
         })
 
-    # Keep `charts` for back-compat with anything that just wants a flat list.
-    rendered = {
+    # Bump just the `last_run_at` timestamp — the heavy `last_rendered`
+    # blob has been removed (the UI re-runs on demand instead of caching
+    # a stale snapshot).
+    db_service.bump_template_last_run(template_id)
+    return {
+        "template_id":    template_id,
         "selections":     rendered_selections,
         "charts":         [s["chart"] for s in rendered_selections],
         "script_reports": script_reports,
         "rendered_at":    time.time(),
     }
-    db_service.update_template_render(template_id, rendered)
-    return {"template_id": template_id, **rendered}

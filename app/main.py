@@ -21,6 +21,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.v1.router import router as v1_router
+from services.db_pool import close_pool
 from services.db_service import ensure_tables
 
 # ── ANSI colors ──────────────────────────────────────────────────────────────
@@ -55,6 +56,14 @@ def startup():
     print(f"  {_GREEN}DB tables ready{_RESET}", flush=True)
     print(f"  {_GREEN}Server is ready to accept requests{_RESET}", flush=True)
     print(f"\n{_BOLD}{'=' * 70}{_RESET}\n", flush=True)
+
+
+@app.on_event("shutdown")
+def shutdown():
+    """Cleanly close the shared Postgres pool so every checked-out
+    connection is returned and the server doesn't leak FDs on restart."""
+    print(f"  {_DIM}Closing PostgreSQL connection pool...{_RESET}", flush=True)
+    close_pool()
 
 
 @app.get("/")

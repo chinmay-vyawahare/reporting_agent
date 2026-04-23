@@ -61,15 +61,10 @@ _BOLD = "\033[1m"
 _RESET = "\033[0m"
 
 
-def _pg_conn():
-    return psycopg2.connect(
-        host=config.PG_HOST,
-        port=config.PG_PORT,
-        dbname=config.PG_DATABASE,
-        user=config.PG_USER,
-        password=config.PG_PASSWORD,
-        connect_timeout=5,
-    )
+# Pool-backed connection (replaces per-call psycopg2.connect — saves the
+# 50-200ms TCP+auth handshake on every retrieval call). Same context manager
+# semantics: commit on clean exit, rollback on exception, always returned.
+from services.db_pool import get_conn as _pg_conn  # noqa: F401
 
 
 def _openai() -> OpenAI:
@@ -86,16 +81,13 @@ def _load_nodes(force: bool = False) -> tuple[list[dict[str, Any]], np.ndarray]:
     if not force and _NODE_CACHE["rows"] is not None and now - _NODE_CACHE["ts"] < _CACHE_TTL:
         return _NODE_CACHE["rows"], _NODE_CACHE["mat"]
 
-    conn = _pg_conn()
-    try:
+    with _pg_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 f"SELECT element_id, node_id, label, entity_type, embedding "
                 f"FROM {EMBED_SCHEMA}.nodes ORDER BY label"
             )
             rows = [dict(r) for r in cur.fetchall()]
-    finally:
-        conn.close()
 
     if not rows:
         _NODE_CACHE.update(rows=[], mat=np.zeros((0, 0), dtype=np.float32), ts=now)
@@ -117,16 +109,13 @@ def _load_paths(force: bool = False) -> tuple[list[dict[str, Any]], np.ndarray]:
     if not force and _PATH_CACHE["rows"] is not None and now - _PATH_CACHE["ts"] < _CACHE_TTL:
         return _PATH_CACHE["rows"], _PATH_CACHE["mat"]
 
-    conn = _pg_conn()
-    try:
+    with _pg_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 f"SELECT path_id, hops, node_element_ids, node_labels, "
                 f"relationship_types, composed_text, embedding FROM {EMBED_SCHEMA}.paths"
             )
             rows = [dict(r) for r in cur.fetchall()]
-    finally:
-        conn.close()
 
     if not rows:
         _PATH_CACHE.update(rows=[], mat=np.zeros((0, 0), dtype=np.float32), ts=now)

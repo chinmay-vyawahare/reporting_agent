@@ -24,6 +24,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 
+from models.chart_types import Chart
 from services import db_service
 
 logger = logging.getLogger(__name__)
@@ -64,34 +65,6 @@ _EXAMPLE_SLOT: dict[str, Any] = {
 }
 
 
-class ChartFromReport(BaseModel):
-    """A chart object as produced by `GET /api/v1/report/stream` (the
-    `complete.charts[i]` payload).
-
-    Pasted as-is into a `CanvasSlot.chart` — no remapping required. Fields
-    are loosely typed (Highcharts options are deeply nested) but every key
-    that comes out of /report/stream is documented here, so Swagger shows
-    real names instead of `additionalProp1`.
-    """
-    chart_id:    str = Field(..., description="Stable UUID assigned by the graph agent; the only handle the chart-edit and propagation APIs use.")
-    chart:       dict[str, Any] | None = Field(default=None, description="Highcharts type config, e.g. {\"type\":\"column\"}")
-    colors:      list[str]      | None = Field(default=None, description="Series colors (default palette injected at creation)")
-    title:       dict[str, Any] | None = Field(default=None, description="{\"text\": \"…\"}")
-    subtitle:    dict[str, Any] | None = Field(default=None, description="{\"text\": \"scope context\"}")
-    xAxis:       dict[str, Any] | list[Any] | None = Field(default=None, description="Categories + axis title")
-    yAxis:       dict[str, Any] | list[Any] | None = Field(default=None, description="Axis title")
-    series:      list[Any]      | None = Field(default=None, description="Highcharts series array")
-    legend:      dict[str, Any] | None = Field(default=None)
-    tooltip:     dict[str, Any] | None = Field(default=None)
-    plotOptions: dict[str, Any] | None = Field(default=None)
-    description: str | None = Field(default=None, description="One-line takeaway")
-    insight:     str | None = Field(default=None, description="2-3 line plain-string insight")
-    script:      str | None = Field(default=None, description="Python+SQL code that produced the chart")
-    sql_index:   int | None = Field(default=None, description="1-indexed pointer back to the SQL block")
-
-    model_config = ConfigDict(extra="allow", json_schema_extra={"example": _EXAMPLE_CHART})
-
-
 class CanvasSlot(BaseModel):
     """One chart slot inside a canvas draft.
 
@@ -105,7 +78,7 @@ class CanvasSlot(BaseModel):
     new tiles in the first free spot on the 12-column grid.
     """
     query_id: str = Field(..., description="From SSE stream_started.query_id")
-    chart:    ChartFromReport = Field(..., description="Full chart object from /report/stream complete.charts[i] — includes chart_id, script, insight, colors, etc.")
+    chart:    Chart = Field(..., description="Full chart object — strict per-type schema (cartesian or pie). chart_id, script, insight, colors are required.")
 
     original_query: str = Field(default="", description="The NL question that produced the chart")
 
@@ -252,32 +225,66 @@ def get_draft(draft_id: str):
 
 @router.patch("/canvas/drafts/{draft_id}", summary="Rename and/or replace slots")
 def patch_draft(draft_id: str, payload: CanvasDraftPatch):
+    """Rename and/or replace the slot list. Each incoming slot's chart is
+    CLONED into its own chart_id row at add-time so subsequent NL edits
+    on the canvas don't leak back into the chat or other canvases.
+    """
     existing = db_service.get_canvas_draft(draft_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Draft not found")
 
-    slots_payload = None
+    if payload.name is not None:
+        db_service.rename_canvas_draft(draft_id, payload.name.strip() or "Untitled report")
+
     if payload.slots is not None:
         if len(payload.slots) > MAX_SLOTS_PER_DRAFT:
             raise HTTPException(
                 status_code=400,
                 detail=f"Max {MAX_SLOTS_PER_DRAFT} slots per draft.",
             )
-        raw = [s.dict() for s in payload.slots]
-        slots_payload = _normalise_positions(raw)
 
-    db_service.update_canvas_draft(
-        draft_id=draft_id,
-        name=payload.name.strip() if payload.name is not None else None,
-        slots=slots_payload,
-    )
+        # Build the slot specs the DB layer wants. Auto-place layout for
+        # any slot the client didn't position, renumber `position` from the
+        # 2D order so list and grid views agree.
+        raw = [s.model_dump() for s in payload.slots]
+        normalised = _normalise_positions(raw)
 
-    # Live mirror: any template finalized from this draft is kept in sync
-    # with the canvas — slot adds, removes, moves, and chart edits all flow
-    # into the linked template's selections without a manual re-finalize.
-    if slots_payload is not None:
+        # CLONE chart_ids for any slot pointing at a chart_id we don't already
+        # own. The first time the user adds a chart from chat → canvas, the
+        # original chart_id is replaced with a fresh clone so edits on this
+        # canvas only touch the clone (not the chat or another canvas).
+        existing_slots = db_service.list_canvas_slots(draft_id)
+        owned_chart_ids = {s["chart_id"] for s in existing_slots}
+        slot_specs: list[dict] = []
+        for s in normalised:
+            chart_obj = s.get("chart") or {}
+            src_chart_id = chart_obj.get("chart_id")
+            if not src_chart_id:
+                raise HTTPException(status_code=422, detail="slot.chart.chart_id is required")
+
+            # If this chart_id is already a slot in this draft, reuse it
+            # (move/resize, no clone). Otherwise clone-on-add.
+            if src_chart_id in owned_chart_ids:
+                slot_chart_id = src_chart_id
+            else:
+                slot_chart_id = str(uuid.uuid4())
+                if not db_service.clone_chart(src_chart_id, slot_chart_id):
+                    # Source chart not in DB yet (test path / direct API use).
+                    # Fall back to reusing the source id and persisting it via save_chart.
+                    slot_chart_id = src_chart_id
+
+            slot_specs.append({
+                "chart_id":       slot_chart_id,
+                "query_id":       s.get("query_id") or "",
+                "original_query": s.get("original_query") or "",
+                "x": s["x"], "y": s["y"], "w": s["w"], "h": s["h"], "position": s["position"],
+            })
+
+        db_service.replace_canvas_slots(draft_id, slot_specs)
+
+        # Mirror into any linked template (selections == slots, by chart_id).
         try:
-            n = db_service.sync_draft_to_template(draft_id, slots_payload)
+            n = db_service.sync_draft_to_template(draft_id)
             if n:
                 logger.info("synced canvas → %d template(s) linked to draft %s", n, draft_id)
         except Exception as e:

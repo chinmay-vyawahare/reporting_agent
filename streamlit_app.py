@@ -32,6 +32,12 @@ import requests
 import streamlit as st  # type: ignore[import-unresolved]
 import streamlit.components.v1 as components  # type: ignore[import-unresolved]
 
+# Typed API client — single source of truth for talking to the backend.
+# Replaces the scattered `requests.*` calls and the requests-monkey-patch
+# trace. The client owns: serialisation, response parsing into Pydantic
+# models, structured ApiError, and a per-call trace ring for debugging.
+from ui.api_client import ApiClient, ApiError
+
 try:
     from streamlit_sortables import sort_items  # type: ignore[import-unresolved]
     _HAVE_SORTABLE = True
@@ -44,6 +50,21 @@ except Exception:
 API_BASE = "http://localhost:8002/api/v1"
 PROJECT_TYPES = ["NTM", "AHLOB Modernization", "Both"]
 MAX_REPORT_CHARTS = 6
+
+
+def get_client() -> ApiClient:
+    """Fresh ApiClient per rerun — but its trace + HTTP session are
+    module-level singletons inside `ui.api_client`, so they persist
+    across reruns. We deliberately DON'T `@st.cache_resource` the
+    instance: caching pinned the methods table from the moment the
+    cache was warmed, so adding a new client method (`get_template`)
+    needed a process restart to become visible. Re-instantiating each
+    time is sub-microsecond and lets new methods land on hot reload.
+    """
+    return ApiClient(API_BASE)
+
+
+api = get_client()
 
 
 # ── JSON sanitizer (NaN/Inf → null) ─────────────────────────────────────────
@@ -380,59 +401,77 @@ def render_highchart(chart_config: dict, container_key: str, height: int = 380):
     components.html(html, height=height, scrolling=False)
 
 
-# ── Canvas API helpers ──────────────────────────────────────────────────────
+# ── Thin shims that adapt the typed ApiClient to the legacy dict-shaped
+# call sites in the rest of this file. New code should call `api.X()`
+# directly; these stay for compatibility while the rest of the file is
+# being incrementally cleaned up.
+#
+# All errors get surfaced to the user via `_show_api_error(...)` so we
+# never silently swallow a failure.
 
-def api_list_drafts(user_id: str):
-    """Return every canvas draft this user has — canvas is user-scoped, so
-    a single canvas can mix charts the user gathered across any threads.
+def _show_api_error(action: str, e: ApiError) -> None:
+    """One canonical error renderer — uses the structured field errors when
+    the server returned FastAPI's validation array."""
+    if e.field_errors:
+        st.error(f"{action} failed ({e.status}) — server rejected the payload:")
+        for loc, msg in e.field_errors[:6]:
+            st.markdown(f"- **`{loc}`** — {msg}")
+    else:
+        st.error(f"{action} failed ({e.status}): {e.detail}")
+
+
+def api_list_drafts(user_id: str) -> list[dict]:
+    """Return every draft for the user with its slots inlined.
+
+    The API's `GET /canvas/drafts` returns metadata only (cheap listing);
+    we hydrate each draft via `GET /canvas/drafts/{id}` so the UI can show
+    slot counts, render the active canvas, and dedupe on add. With <50
+    drafts per user, the per-draft fetch is sub-ms thanks to the connection
+    pool — well within Streamlit's render budget.
     """
     try:
-        r = requests.get(f"{API_BASE}/canvas/drafts",
-                         params={"user_id": user_id}, timeout=10)
-        return r.json().get("drafts", []) if r.status_code == 200 else []
-    except Exception:
+        meta_drafts = api.list_drafts(user_id)
+    except (ApiError, requests.RequestException):
         return []
 
-
-def api_create_draft(user_id: str, name: str, project_type: str):
-    r = requests.post(
-        f"{API_BASE}/canvas/drafts",
-        json={
-            "user_id":   user_id,
-            "name":      name,
-            "project_type": project_type,
-        },
-        timeout=10,
-    )
-    if r.status_code != 200:
-        st.error(f"Create draft failed ({r.status_code}): {r.text[:200]}")
-        return None
-    return r.json()
+    out: list[dict] = []
+    for d in meta_drafts:
+        try:
+            full = api.get_draft(d.draft_id)
+            out.append(full.model_dump())
+        except (ApiError, requests.RequestException):
+            # Fall back to metadata-only on any per-draft hiccup.
+            out.append({**d.model_dump(), "slots": []})
+    return out
 
 
-def api_patch_draft(draft_id: str, name=None, slots=None):
-    body = {}
-    if name is not None:
-        body["name"] = name
-    if slots is not None:
-        body["slots"] = _sanitize_for_json(slots)
-    r = requests.patch(f"{API_BASE}/canvas/drafts/{draft_id}", json=body, timeout=15)
-    if r.status_code != 200:
-        st.error(f"Update draft failed ({r.status_code}): {r.text[:200]}")
-        return None
-    return r.json()
-
-
-def api_delete_draft(draft_id: str):
-    r = requests.delete(f"{API_BASE}/canvas/drafts/{draft_id}", timeout=10)
-    return r.status_code == 200
-
-
-def api_list_thread_queries(thread_id: str):
+def api_create_draft(user_id: str, name: str, project_type: str) -> dict | None:
     try:
-        r = requests.get(f"{API_BASE}/threads/{thread_id}/queries", timeout=10)
-        return r.json().get("queries", []) if r.status_code == 200 else []
-    except Exception:
+        return api.create_draft(user_id=user_id, name=name, project_type=project_type).model_dump()
+    except ApiError as e:
+        _show_api_error("Create draft", e); return None
+
+
+def api_patch_draft(draft_id: str, name=None, slots=None) -> dict | None:
+    try:
+        # _sanitize_for_json: keep NaN/Inf out of the JSON body
+        clean_slots = _sanitize_for_json(slots) if slots is not None else None
+        return api.patch_draft(draft_id, name=name, slots=clean_slots).model_dump()
+    except ApiError as e:
+        _show_api_error("Update draft", e); return None
+
+
+def api_delete_draft(draft_id: str) -> bool:
+    try:
+        return api.delete_draft(draft_id)
+    except ApiError:
+        return False
+
+
+def api_list_thread_queries(thread_id: str) -> list[dict]:
+    try:
+        return [q.model_dump() for q in api.list_thread_queries(thread_id)]
+    except (ApiError, requests.RequestException):
         return []
 
 
@@ -466,17 +505,15 @@ _init_state()
 def _list_threads_for_user(uid: str) -> list[dict]:
     """Pull every thread this user has, newest first. Empty list on error."""
     try:
-        r = requests.get(f"{API_BASE}/threads", params={"user_id": uid}, timeout=10)
-        return r.json().get("threads", []) if r.status_code == 200 else []
-    except Exception:
+        return [t.model_dump() for t in api.list_threads(uid)]
+    except (ApiError, requests.RequestException):
         return []
 
 
 def _list_queries_in_thread(tid: str) -> list[dict]:
     try:
-        r = requests.get(f"{API_BASE}/threads/{tid}/queries", timeout=10)
-        return r.json().get("queries", []) if r.status_code == 200 else []
-    except Exception:
+        return [q.model_dump() for q in api.list_thread_queries(tid)]
+    except (ApiError, requests.RequestException):
         return []
 
 
@@ -540,16 +577,12 @@ with st.sidebar:
 
     st.divider()
     try:
-        _t_resp = requests.get(f"{API_BASE}/templates",
-                               params={"user_id": user_id}, timeout=10)
-        _n_templates = len(_t_resp.json().get("templates", [])) if _t_resp.status_code == 200 else 0
-    except Exception:
+        _n_templates = len(api.list_templates(user_id))
+    except (ApiError, requests.RequestException):
         _n_templates = 0
     try:
-        _d_resp = requests.get(f"{API_BASE}/canvas/drafts",
-                               params={"user_id": user_id}, timeout=10)
-        _n_drafts = len(_d_resp.json().get("drafts", [])) if _d_resp.status_code == 200 else 0
-    except Exception:
+        _n_drafts = len(api.list_drafts(user_id))
+    except (ApiError, requests.RequestException):
         _n_drafts = 0
     st.caption(f"📚 **{_n_drafts}** canvas draft(s) · **{_n_templates}** template(s)")
     st.caption("_Manage them in the **Canvas** and **Templates** tabs →_")
@@ -558,11 +591,20 @@ with st.sidebar:
 # ── Rehydrate chat from the DB ──────────────────────────────────────────────
 
 def _fetch_charts_for_query(query_id: str) -> list[dict]:
-    """Pull the chart rows for a query from the new charts table. Returns [] on error."""
+    """Return the chart objects (NOT the row wrappers) for a query.
+
+    `/charts?query_id=` returns rows of the form
+        { chart_id, query_id, user_id, …, chart: {…actual chart…} }
+    where the row's `chart` field is the API-shaped chart dict (the same
+    shape /report/stream emits). The rest of the UI deals in chart dicts
+    (canvas slot validation, edits, render), so we unwrap to the inner
+    `chart` here — keeping a single in-memory shape across the app.
+    """
     try:
-        r = requests.get(f"{API_BASE}/charts", params={"query_id": query_id}, timeout=10)
-        return r.json().get("charts", []) if r.status_code == 200 else []
-    except Exception:
+        # api.list_charts_by_query returns typed ChartRow objects; the inner
+        # `.chart` is the validated Chart object the rest of the UI uses.
+        return [row.chart.model_dump() for row in api.list_charts_by_query(query_id)]
+    except (ApiError, requests.RequestException):
         return []
 
 
@@ -594,16 +636,16 @@ if not st.session_state.queries:
 # one tied to the current chat.
 
 drafts = api_list_drafts(user_id)
-current_thread = st.session_state.thread_id
 
 # If the stored active_draft_id no longer exists, clear it.
 valid_draft_ids = {d["draft_id"] for d in drafts}
 if st.session_state.active_draft_id and st.session_state.active_draft_id not in valid_draft_ids:
     st.session_state.active_draft_id = None
 if not st.session_state.active_draft_id and drafts:
-    # Prefer a draft in the current thread, else most-recently-updated overall.
-    in_thread = [d for d in drafts if d.get("thread_id") == current_thread]
-    st.session_state.active_draft_id = (in_thread or drafts)[0]["draft_id"]
+    # Canvas drafts are user-scoped (no thread_id) — pick the most recently
+    # updated draft as the default active one. The list is already sorted
+    # newest-first by the backend.
+    st.session_state.active_draft_id = drafts[0]["draft_id"]
 
 
 # ── Helpers used by chart cards ─────────────────────────────────────────────
@@ -621,6 +663,13 @@ def _chart_in_draft(draft: dict, chart_id: str) -> bool:
 def _add_chart_to_draft(draft: dict, q_rec: dict, chart_idx: int):
     slots = list(draft.get("slots") or [])
     chart = q_rec["charts"][chart_idx]
+    # Defensive unwrap: if this came from /charts?query_id= as a row wrapper
+    # (top-level query_id/user_id/title_text), the actual chart object is at
+    # row["chart"]. Strict per-type schema rejects the row shape.
+    if isinstance(chart, dict) and "chart" in chart and isinstance(chart["chart"], dict) and chart["chart"].get("type") in (
+        "column", "bar", "line", "area", "spline", "areaspline", "scatter", "pie", "donut"
+    ) and chart.get("title_text") is not None:
+        chart = chart["chart"]
     cid = chart.get("chart_id") or ""
 
     if not cid:
@@ -650,11 +699,13 @@ def _remove_slot(draft_id: str, slots: list, position: int):
 
 
 def _sync_chart_everywhere_in_session(chart_id: str, patched_chart: dict):
-    """Mirror an edited chart into the in-session query records and drafts.
+    """Mirror an edited chart into the in-session caches.
 
-    Server-side propagation is already done by /charts/edit (see
-    db_service.propagate_chart_content), so this function only refreshes the
-    Streamlit caches so the user sees the edit without a hard reload.
+    The DB now stores each canvas slot's chart under its OWN chart_id
+    (clone-on-add), so /charts/edit only mutates one row server-side.
+    This function just refreshes the Streamlit-side caches so the user
+    sees the new colors/labels without a hard reload — it doesn't leak
+    across canvases or back into the chat.
     """
     for q in st.session_state.queries:
         for i, c in enumerate(q.get("charts", []) or []):
@@ -700,19 +751,14 @@ def _edit_chart_dialog(chart_id: str, chart_title: str):
             st.stop()
         try:
             with st.spinner("Patching the chart config..."):
-                resp = requests.post(
-                    f"{API_BASE}/charts/edit",
-                    json={"chart_id": chart_id, "instruction": instruction.strip()},
-                    timeout=90,
-                )
-            if resp.status_code != 200:
-                st.error(f"Edit failed ({resp.status_code}): {resp.text[:300]}")
-                st.stop()
-            patched = (resp.json() or {}).get("chart") or {}
+                edit = api.edit_chart(chart_id, instruction.strip())
+            patched = edit.chart.model_dump()
             _sync_chart_everywhere_in_session(chart_id, patched)
             st.success("Edit applied and saved.")
             st.rerun()
-        except Exception as e:
+        except ApiError as e:
+            _show_api_error("Chart edit", e); st.stop()
+        except requests.RequestException as e:
             st.error(f"Edit failed: {e}")
 
 
@@ -734,6 +780,10 @@ def _run_query(query: str):
     query_id = None
 
     try:
+        # The ONE place we bypass the typed `api` client: SSE is a long-lived
+        # streaming response, not a JSON request/response. Progress events are
+        # surfaced to the user via the streamlit progress bar below, so this
+        # call doesn't need to appear in the API-trace panel.
         resp = requests.get(sse_url, stream=True, timeout=600)
         if resp.status_code != 200:
             progress.empty()
@@ -853,22 +903,19 @@ def _render_chart_card(q_rec: dict, chart: dict, idx: int, active_draft: dict | 
             for d in drafts:
                 did = d["draft_id"]
                 n_slots = len(d.get("slots") or [])
-                from_other_thread = d.get("thread_id") != current_thread
                 already = _chart_in_draft(d, source_key)
                 full = n_slots >= MAX_REPORT_CHARTS and not already
-                dot = "🧵" if from_other_thread else "📄"
                 if already:
-                    btn = f"✓ {dot} {d.get('name') or 'Untitled'} ({n_slots}/{MAX_REPORT_CHARTS})"
+                    btn = f"✓ 📄 {d.get('name') or 'Untitled'} ({n_slots}/{MAX_REPORT_CHARTS})"
                 elif full:
-                    btn = f"⛔ {dot} {d.get('name') or 'Untitled'} (full)"
+                    btn = f"⛔ 📄 {d.get('name') or 'Untitled'} (full)"
                 else:
-                    btn = f"{dot} {d.get('name') or 'Untitled'} ({n_slots}/{MAX_REPORT_CHARTS})"
+                    btn = f"📄 {d.get('name') or 'Untitled'} ({n_slots}/{MAX_REPORT_CHARTS})"
                 if st.button(
                     btn,
                     key=f"addto_{q_rec['query_id']}_{idx}_{did}",
                     disabled=already or full,
                     use_container_width=True,
-                    help=("From another thread" if from_other_thread else None),
                 ):
                     ok, msg = _add_chart_to_draft_by_id(did, q_rec, idx)
                     st.toast(msg, icon="✅" if ok else "⚠️")
@@ -949,16 +996,21 @@ with col_chat:
 # ── RIGHT: Canvas + Templates tabs ──────────────────────────────────────────
 
 with col_canvas:
-    # Pull a fresh template list once so the tab badges show counts
+    # Pull templates with their selections inlined.
+    # The list endpoint is metadata-only (cheap), so per-template
+    # selections are hydrated via get_template() — same pattern as
+    # api_list_drafts. Sub-millisecond per call thanks to the pool.
     try:
-        _t_list_resp = requests.get(
-            f"{API_BASE}/templates", params={"user_id": user_id}, timeout=10,
-        )
-        templates_for_right = (
-            _t_list_resp.json().get("templates", [])
-            if _t_list_resp.status_code == 200 else []
-        )
-    except Exception:
+        _meta_tpls = api.list_templates(user_id)
+        templates_for_right = []
+        for t in _meta_tpls:
+            try:
+                templates_for_right.append(api.get_template(t.template_id).model_dump())
+            except (ApiError, requests.RequestException):
+                # Fall back to metadata-only on a per-template hiccup so
+                # the rest of the list still renders.
+                templates_for_right.append({**t.model_dump(), "selections": []})
+    except (ApiError, requests.RequestException):
         templates_for_right = []
 
     tab_canvas_pane, tab_templates_pane = st.tabs([
@@ -998,8 +1050,6 @@ with tab_canvas_pane:
         for d in drafts:
             did = d["draft_id"]
             is_active = (did == st.session_state.active_draft_id)
-            from_this_thread = (d.get("thread_id") == current_thread)
-            dot = "📄" if from_this_thread else "🧵"
             n_slots = len(d.get("slots") or [])
             updated = str(d.get("updated_at") or "")[:19]
 
@@ -1010,7 +1060,7 @@ with tab_canvas_pane:
                     f"<div style='padding:10px 12px;border:1px solid {border_color};"
                     f"border-radius:8px;background:{bg};margin-bottom:6px;"
                     f"display:flex;align-items:center;justify-content:space-between;'>"
-                    f"<div><b>{dot} {(d.get('name') or 'Untitled')}</b>"
+                    f"<div><b>📄 {(d.get('name') or 'Untitled')}</b>"
                     f"  <span style='color:#6b7280;font-size:0.85em;'>"
                     f"· {n_slots}/{MAX_REPORT_CHARTS} charts · updated {updated}</span></div>"
                     f"</div>",
@@ -1190,8 +1240,8 @@ with tab_canvas_pane:
         st.divider()
         # Finalize — upserts by source_draft_id. If a template was already
         # finalized from this canvas, the existing template is updated in
-        # place (title + slots + last_rendered) so we don't accumulate
-        # duplicates every time the user clicks Finalize.
+        # place (title + selections) so we don't accumulate duplicates
+        # every time the user clicks Finalize.
         existing_tpl_for_draft = next(
             (t for t in templates_for_right
              if t.get("source_draft_id") == active_draft["draft_id"]),
@@ -1240,20 +1290,22 @@ with tab_canvas_pane:
                 ],
             }
             try:
-                resp = requests.post(f"{API_BASE}/templates",
-                                     json=_sanitize_for_json(payload), timeout=30)
-                if resp.status_code == 200:
-                    body = resp.json()
-                    tid = body.get("template_id")
-                    action = body.get("action") or "saved"
-                    st.success(
-                        f"Template **{action}**. Open the **📄 Templates** tab to view it."
-                    )
-                    st.session_state.template_view = tid
-                    st.rerun()
-                else:
-                    st.error(f"Save failed ({resp.status_code}): {resp.text[:200]}")
-            except Exception as e:
+                clean = _sanitize_for_json(payload)
+                action_resp = api.upsert_template(
+                    user_id=clean["user_id"],
+                    title=clean["title"],
+                    project_type=clean.get("project_type", ""),
+                    source_draft_id=clean.get("source_draft_id"),
+                    selections=clean["selections"],
+                )
+                st.success(
+                    f"Template **{action_resp.action}**. Open the **📄 Templates** tab to view it."
+                )
+                st.session_state.template_view = action_resp.template_id
+                st.rerun()
+            except ApiError as e:
+                _show_api_error("Save template", e)
+            except requests.RequestException as e:
                 st.error(f"Save failed: {e}")
 
 
@@ -1324,15 +1376,14 @@ with tab_templates_pane:
                              type="primary", use_container_width=True):
                     with st.spinner("Re-running scripts…"):
                         try:
-                            resp = requests.post(f"{API_BASE}/templates/{t_tid}/run", timeout=600)
-                            if resp.status_code == 200:
-                                st.session_state[f"_rendered_{t_tid}"] = resp.json()
-                                st.session_state.template_view = t_tid
-                                st.toast("Refreshed.", icon="🔄")
-                                st.rerun()
-                            else:
-                                st.error(f"Re-run failed ({resp.status_code})")
-                        except Exception as e:
+                            run = api.run_template(t_tid)
+                            st.session_state[f"_rendered_{t_tid}"] = run.model_dump()
+                            st.session_state.template_view = t_tid
+                            st.toast("Refreshed.", icon="🔄")
+                            st.rerun()
+                        except ApiError as e:
+                            _show_api_error("Re-run", e)
+                        except requests.RequestException as e:
                             st.error(f"Re-run failed: {e}")
             with col_del:
                 pk = f"_tpl_card_del_{t_tid}"
@@ -1340,18 +1391,17 @@ with tab_templates_pane:
                     if st.button("✓", key=f"tpl_card_del_ok_{t_tid}",
                                  use_container_width=True, help="Confirm delete"):
                         try:
-                            r = requests.delete(f"{API_BASE}/templates/{t_tid}", timeout=15)
-                            if r.status_code == 200:
-                                st.session_state.pop(pk, None)
-                                st.session_state.pop(f"_rendered_{t_tid}", None)
-                                if st.session_state.template_view == t_tid:
-                                    st.session_state.template_view = None
-                                st.toast("Template deleted.", icon="🗑️")
-                                st.rerun()
-                            else:
-                                st.session_state.pop(pk, None)
-                                st.error(f"Delete failed ({r.status_code})")
-                        except Exception as e:
+                            api.delete_template(t_tid)
+                            st.session_state.pop(pk, None)
+                            st.session_state.pop(f"_rendered_{t_tid}", None)
+                            if st.session_state.template_view == t_tid:
+                                st.session_state.template_view = None
+                            st.toast("Template deleted.", icon="🗑️")
+                            st.rerun()
+                        except ApiError as e:
+                            st.session_state.pop(pk, None)
+                            _show_api_error("Delete template", e)
+                        except requests.RequestException as e:
                             st.session_state.pop(pk, None)
                             st.error(f"Delete failed: {e}")
                 else:
@@ -1364,9 +1414,12 @@ with tab_templates_pane:
         st.divider()
 
         # ── Render the currently-open template below the list ───────────
-        # Single-template GET endpoint was dropped server-side — pick the
-        # current one out of the list we already fetched for the badge.
-        meta = next((t for t in tpls if t["template_id"] == tid), {})
+        # `templates_for_right` already includes selections (we hydrated
+        # the list above), so no extra fetch needed for the open template.
+        meta: dict = next(
+            (t for t in templates_for_right if t.get("template_id") == tid),
+            {},
+        )
 
         if meta:
             st.markdown(f"### 📄 {meta.get('title', '')}")
@@ -1376,33 +1429,29 @@ with tab_templates_pane:
                 f"last_run: `{meta.get('last_run_at', '')}`"
             )
 
-            selections = meta.get("selections") or []
-            if isinstance(selections, str):
-                try:
-                    selections = json.loads(selections)
-                except Exception:
-                    selections = []
             selections = sorted(
-                selections,
+                meta.get("selections") or [],
                 key=lambda s: int(s.get("position", 0)
                                   if s.get("position") is not None
-                                  else selections.index(s)),
+                                  else 0),
             )
 
-            rendered = st.session_state.get(f"_rendered_{tid}")
-            if rendered is None:
-                last = meta.get("last_rendered")
-                if isinstance(last, str):
-                    try:
-                        last = json.loads(last)
-                    except Exception:
-                        last = None
-                if isinstance(last, dict):
-                    rendered = last
-
-            charts_to_show = (rendered or {}).get("charts") or []
-            if not charts_to_show and selections:
-                charts_to_show = [s.get("chart") for s in selections if s.get("chart")]
+            # `last_rendered` cache was removed — show the saved canvas
+            # snapshot from `selections` by default. If the user just clicked
+            # "Re-run", `_rendered_{tid}` carries the freshly rebuilt
+            # SELECTIONS (each with its rebuilt chart) for this session.
+            rendered = st.session_state.get(f"_rendered_{tid}") or {}
+            rendered_selections = rendered.get("selections") or []
+            if rendered_selections:
+                # Sort the rerun result the same way we sort saved selections.
+                rendered_selections = sorted(
+                    rendered_selections,
+                    key=lambda s: int(s.get("position") if s.get("position") is not None else 0),
+                )
+                # The rerun's selections take precedence over the saved snapshot
+                # — same layout, fresh chart contents.
+                selections = rendered_selections
+            charts_to_show = [s.get("chart") for s in selections if s.get("chart")]
 
             reports = (rendered or {}).get("script_reports") or []
             if reports:

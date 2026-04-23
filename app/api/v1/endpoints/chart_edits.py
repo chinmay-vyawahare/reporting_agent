@@ -1,13 +1,18 @@
 """
-Chart edit API — apply a natural-language styling edit to a generated chart
-and persist the result so the edit survives refresh / restart.
+Chart edit API — apply a natural-language styling edit to a saved chart.
 
 POST /api/v1/charts/edit
   body: { "chart_id": "...", "instruction": "make the bars red" }
-  returns: { "chart_id": "...", "chart": {...patched}, "propagation": {...} }
+  returns: { "chart_id": "...", "chart": {...patched} }
+
+The edit is **canvas-scoped by construction**: every chart added to a canvas
+gets its own cloned chart_id (see canvas PATCH endpoint), so editing a
+chart_id only mutates that one row — it never leaks back into the chat or
+into another canvas. The linked template's selection points at the SAME
+chart_id, so canvas edits flow into the template automatically.
 
 GET /api/v1/charts/edits?chart_id=...
-  returns the edit history for that chart.
+  returns the edit history for that chart (audit log: instruction + when).
 """
 from __future__ import annotations
 
@@ -90,27 +95,15 @@ def edit_chart(payload: ChartEditIn):
     if not db_service.update_chart_by_id(payload.chart_id, patched):
         raise HTTPException(status_code=500, detail="Failed to persist edited chart")
 
-    db_service.log_chart_edit(
-        row.get("query_id", ""), payload.chart_id, payload.instruction, patched,
-    )
+    db_service.log_chart_edit(payload.chart_id, payload.instruction)
 
-    # Propagate the new chart content into every canvas draft and every
-    # template that carries this chart_id.
-    try:
-        propagation = db_service.propagate_chart_content(payload.chart_id, patched)
-        if propagation.get("drafts") or propagation.get("templates"):
-            logger.info(
-                "chart-edit propagated: drafts=%d templates=%d (chart_id=%s)",
-                propagation["drafts"], propagation["templates"], payload.chart_id,
-            )
-    except Exception as e:
-        logger.warning("chart-edit propagation failed (non-fatal): %s", e)
-        propagation = {"drafts": 0, "templates": 0}
-
+    # No propagation — each canvas owns its own cloned chart_id, so editing
+    # one chart_id only ever mutates that one row. The linked template's
+    # selection points at the same chart_id, so canvas edits flow into the
+    # template by reference, not by copying.
     return {
-        "chart_id":    payload.chart_id,
-        "chart":       patched,
-        "propagation": propagation,
+        "chart_id": payload.chart_id,
+        "chart":    patched,
     }
 
 

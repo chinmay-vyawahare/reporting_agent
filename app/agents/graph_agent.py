@@ -65,23 +65,23 @@ def _validate_chart_structure(parsed: dict) -> list[str]:
             continue
 
         chart_type = None
-        if "chart" in chart and isinstance(chart["chart"], dict):
-            chart_type = chart["chart"].get("type")
-        elif "type" in chart:
-            chart_type = chart["type"]
-
-        if not chart_type:
-            issues.append(f"Chart {i+1} missing chart type (need chart.type or type)")
-
-        if "title" not in chart:
-            issues.append(f"Chart {i+1} missing title")
-
-        if "series" not in chart or not isinstance(chart.get("series"), list):
-            issues.append(f"Chart {i+1} missing series array")
-        elif chart["series"]:
-            for j, s in enumerate(chart["series"]):
-                if "data" not in s:
-                    issues.append(f"Chart {i+1}, series {j+1} missing data")
+        # Strict per-type validation against the typed schema. We need to
+        # tolerate the agent not having stamped chart_id yet (we add it
+        # post-LLM in _assign_chart_ids), so we slip in a placeholder.
+        from models.chart_types import parse_chart
+        from pydantic import ValidationError as _VErr
+        check_chart = dict(chart)
+        check_chart.setdefault("chart_id", "00000000-0000-0000-0000-000000000000")
+        check_chart.setdefault("colors", DEFAULT_COLOR_PALETTE)
+        check_chart.setdefault("script", "placeholder")  # filled later from evidence
+        try:
+            parse_chart(check_chart)
+        except (_VErr, ValueError) as e:
+            # First three field errors for compactness
+            errs = e.errors()[:3] if isinstance(e, _VErr) else [{"loc": (), "msg": str(e)}]
+            for err in errs:
+                loc = ".".join(str(x) for x in err.get("loc", ()))
+                issues.append(f"Chart {i+1}: {loc} → {err.get('msg', err)}")
 
     return issues
 

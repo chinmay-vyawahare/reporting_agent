@@ -14,6 +14,7 @@ from typing import Any, Callable
 
 from agents.traversal import traversal_node
 from agents.graph_agent import generate_charts
+from services import db_service
 from services.embedding_retrieval import retrieve_context
 from services.thread_memory import get_thread_context_summary
 from tools.neo4j_tool import neo4j_tool
@@ -200,6 +201,23 @@ def stream_report(
             "rationale": chart_result.get("rationale", ""),
             "errors": errors,
         }
+
+        # Persist BEFORE emitting `complete` so a client that immediately
+        # queries `/charts?query_id=` doesn't race the DB write.
+        try:
+            total_pipeline_ms = (time.perf_counter() - pipeline_start) * 1000
+            db_service.update_query_complete(
+                query_id=query_id,
+                charts=charts,                        # full charts (with evidence)
+                rationale=chart_result.get("rationale", ""),
+                traversal_findings=traversal_findings,
+                traversal_steps=traversal_steps,
+                duration_ms=total_pipeline_ms,
+                errors=errors,
+            )
+        except Exception as e:
+            logger.warning("update_query_complete failed (non-fatal, response still sent): %s", e)
+
         emit("complete", slim_result)
         return result
 
