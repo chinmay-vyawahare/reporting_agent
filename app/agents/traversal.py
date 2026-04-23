@@ -196,11 +196,21 @@ def traversal_node(state: dict[str, Any]) -> dict[str, Any]:
     else:
         safe_retrieval_context = ""
 
+    # Conversation memory: a 3-5 line summary of the last few turns in this
+    # thread, generated upstream in stream_report. Empty when there's no
+    # prior history (or no thread_id).
+    from services.thread_memory import render_for_prompt as _render_thread_context
+    thread_context_block = _render_thread_context(state.get("thread_context", ""))
+    safe_thread_context = thread_context_block.replace("{", "{{").replace("}", "}}")
+    if thread_context_block:
+        print(f"  {_GREEN}Thread context injected ({len(thread_context_block)} chars){_RESET}", flush=True)
+
     from datetime import date as _date
     system_prompt = TRAVERSAL_SYSTEM.format(
         kg_schema=safe_kg_schema,
         today_date=_date.today().isoformat(),
         project_type_filter=project_type_filter,
+        thread_context=safe_thread_context,
         retrieval_context=safe_retrieval_context,
     )
 

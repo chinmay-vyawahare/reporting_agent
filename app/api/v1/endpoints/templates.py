@@ -1,13 +1,15 @@
 """
-Chat threads + report templates API.
+Report templates API — kept intentionally small.
 
 Endpoints:
-  GET  /threads?user_id=                 list a user's chat threads
-  GET  /threads/{thread_id}/queries      ordered queries in a thread
-  POST /templates                         create a template (selected charts + evidence)
-  GET  /templates?user_id=               list templates for a user
-  GET  /templates/{template_id}          fetch one template
-  POST /templates/{template_id}/run      re-run the template's scripts with fresh data
+  POST   /templates                       create a template from a canvas selection
+  GET    /templates?user_id=              list a user's templates
+  DELETE /templates/{template_id}         delete a template
+  POST   /templates/{template_id}/run     re-run the template's scripts with today's data
+
+The chat-threads endpoints stay in this file (separate concern from templates),
+but every "extras" endpoint (PATCH, GET-single, draft-upsert) was removed in
+favor of these four.
 """
 from __future__ import annotations
 
@@ -18,230 +20,129 @@ import uuid
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from services import db_service
 from services.insight_refresh import refresh_insight
 from tools.python_sandbox import PythonSandbox
+from agents.graph_agent import _round_floats
+# Re-use the canvas slot example + ChartFromReport so a slot and a template
+# selection look identical in the docs (they ARE identical — a template
+# selection is a finalized canvas slot).
+from api.v1.endpoints.canvas import ChartFromReport, _EXAMPLE_CHART, _EXAMPLE_SLOT
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Templates"])
 
+MAX_CHARTS_PER_TEMPLATE = 6
+
 
 # ── Models ──────────────────────────────────────────────────────────────────
 
 class TemplateSelectionIn(BaseModel):
-    """One chart selected for inclusion in a finalized report.
+    """One chart selected for a saved template.
 
-    Layout fields are carried verbatim from the canvas draft so a finalized
-    template reproduces the exact 2D positioning the user arranged.
+    Identical shape to `CanvasSlot` — when finalizing, copy each draft slot
+    straight into `selections`. The chart object contains its own `script`
+    (what powers `POST /templates/{id}/run`).
 
-    * `x`, `y`, `w`, `h` — 12-column grid coordinates + size.
-    * `position`         — legacy list index (kept for back-compat, server
-                           re-derives from y/x on write).
+    Required (mirrored from /report/stream):
+      * `query_id` — the SSE stream_started.query_id
+      * `chart`    — the full chart object from complete.charts[i]
+                     (its `chart.script` is the runnable code)
+
+    Optional: `original_query`, layout (`x` / `y` / `w` / `h` / `position`).
     """
-    position:       int | None = Field(default=None, ge=0)
-    x:              int | None = Field(default=None, ge=0, le=11)
-    y:              int | None = Field(default=None, ge=0)
-    w:              int | None = Field(default=None, ge=1, le=12)
-    h:              int | None = Field(default=None, ge=1)
-    query_id:       str
-    chart_index:    int = Field(..., ge=0)
-    chart:          dict[str, Any]
-    evidence:       dict[str, Any] | None = None
-    original_query: str = ""
+    query_id: str = Field(..., description="From SSE stream_started.query_id")
+    chart:    ChartFromReport = Field(..., description="Full chart object from /report/stream complete.charts[i] — includes chart_id, script, insight, colors, etc.")
 
-    class Config:
-        extra = "allow"
+    original_query: str = Field(default="", description="The NL question that produced the chart")
+
+    x:        int | None = Field(default=None, ge=0, le=11, description="Column offset 0..11 on the 12-col grid")
+    y:        int | None = Field(default=None, ge=0,        description="Row offset (≥0)")
+    w:        int | None = Field(default=None, ge=1, le=12, description="Width in cols 1..12")
+    h:        int | None = Field(default=None, ge=1,        description="Height in rows ≥1")
+    position: int | None = Field(default=None, ge=0,        description="Legacy list order; server re-derives from (y, x)")
+
+    model_config = ConfigDict(
+        extra="ignore",                         # → no `additionalProp1` in Swagger
+        json_schema_extra={"example": _EXAMPLE_SLOT},
+    )
+
+
+_EXAMPLE_TEMPLATE: dict[str, Any] = {
+    "user_id":         "u_123",
+    "title":           "Q1 NTM weekly run-rate",
+    "project_type":    "NTM",
+    "source_draft_id": "14dfd449-d9b6-484e-858a-e3d7b36a353a",
+    "selections":      [_EXAMPLE_SLOT],
+}
 
 
 class TemplateIn(BaseModel):
-    user_id: str
-    username: str
-    thread_id: str | None = None
-    title: str
-    project_type: str = ""
-    # Link back to the canvas draft this template was finalized from. Present
-    # when the UI finalizes a draft; absent if a template is built directly
-    # via the API. When present, layout changes to that draft propagate into
-    # this template's selections automatically (see
-    # db_service.propagate_draft_layout).
-    source_draft_id: str | None = None
-    selections: list[TemplateSelectionIn]
-
-
-# ── Thread routes ───────────────────────────────────────────────────────────
-
-@router.get("/threads", summary="List chat threads for a user")
-def list_threads(user_id: str = Query(...), limit: int = Query(default=50, le=200)):
-    return {"threads": db_service.get_threads_by_user(user_id, limit=limit)}
-
-
-@router.get("/threads/{thread_id}/queries", summary="List queries in a thread")
-def list_thread_queries(thread_id: str, limit: int = Query(default=100, le=500)):
-    rows = db_service.get_queries_for_thread(thread_id, limit=limit)
-    return {"thread_id": thread_id, "queries": rows}
-
-
-# ── Template routes ─────────────────────────────────────────────────────────
-
-MAX_CHARTS_PER_TEMPLATE = 6
-
-
-class TemplatePatch(BaseModel):
-    """Partial update for an existing template. Send only the fields you
-    want to change; everything else stays as it was."""
-    title:           str | None = None
-    project_type:    str | None = None
-    source_draft_id: str | None = None
-    selections:      list[TemplateSelectionIn] | None = None
-
-
-@router.patch("/templates/{template_id}", summary="Partially update a template (rename, replace selections, etc.)")
-def patch_template(template_id: str, payload: TemplatePatch):
-    existing = db_service.get_template(template_id)
-    if not existing:
-        raise HTTPException(status_code=404, detail="Template not found")
-
-    sels_payload = None
-    last_rendered_payload = None
-    if payload.selections is not None:
-        if len(payload.selections) > MAX_CHARTS_PER_TEMPLATE:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Max {MAX_CHARTS_PER_TEMPLATE} charts, got {len(payload.selections)}.",
-            )
-        from api.v1.endpoints.canvas import _normalise_positions as _norm_layout
-        raw = [s.dict() for s in payload.selections]
-        sels_payload = _norm_layout(raw)
-        last_rendered_payload = {"charts": [s["chart"] for s in sels_payload]}
-
-    ok = db_service.update_template(
-        template_id=template_id,
-        title=payload.title.strip() if payload.title is not None else None,
-        project_type=payload.project_type if payload.project_type is not None else None,
-        selections=sels_payload,
-        last_rendered=last_rendered_payload,
-        source_draft_id=payload.source_draft_id if payload.source_draft_id is not None else None,
+    user_id:      str = Field(..., description="User identifier")
+    title:        str = Field(..., description="Display title for the template")
+    project_type: str = Field(default="", description="NTM | AHLOB Modernization | Both")
+    source_draft_id: str | None = Field(
+        default=None,
+        description=(
+            "If set, links this template to a canvas draft. POST is then an UPSERT: "
+            "if a template already exists for this draft_id it is UPDATED in place "
+            "(never duplicated). Subsequent canvas changes are auto-mirrored."
+        ),
     )
-    if not ok:
-        raise HTTPException(status_code=500, detail="Update failed")
-    return db_service.get_template(template_id)
-
-
-@router.post("/templates", summary="Create a template, OR update one that already exists for the same source_draft_id (upsert)")
-def create_template(payload: TemplateIn):
-    if not payload.selections:
-        raise HTTPException(status_code=400, detail="At least one chart selection is required.")
-    if len(payload.selections) > MAX_CHARTS_PER_TEMPLATE:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Max {MAX_CHARTS_PER_TEMPLATE} charts per template, got {len(payload.selections)}.",
-        )
-
-    raw_selections = [s.dict() for s in payload.selections]
-    # Reuse the canvas layout normaliser so templates respect the exact 2D
-    # positioning from the draft. This assigns x/y/w/h for any slots that
-    # arrive without them and re-derives `position` from the 2D order.
-    from api.v1.endpoints.canvas import _normalise_positions as _norm_layout
-    raw_selections = _norm_layout(raw_selections)
-    last_rendered = {"charts": [s["chart"] for s in raw_selections]}
-
-    # Upsert: if the source draft already has a template, update it in place
-    # so finalizing the same canvas twice doesn't sprout duplicate templates.
-    existing = (db_service.find_template_by_draft(payload.source_draft_id)
-                if payload.source_draft_id else None)
-
-    if existing:
-        template_id = existing["template_id"]
-        db_service.update_template(
-            template_id=template_id,
-            title=payload.title,
-            project_type=payload.project_type,
-            selections=raw_selections,
-            last_rendered=last_rendered,
-            source_draft_id=payload.source_draft_id,
-        )
-        return {"template_id": template_id, "action": "updated"}
-
-    template_id = str(uuid.uuid4())
-    db_service.create_template(
-        template_id=template_id,
-        user_id=payload.user_id,
-        username=payload.username,
-        thread_id=payload.thread_id,
-        title=payload.title,
-        project_type=payload.project_type,
-        selections=raw_selections,
-        last_rendered=last_rendered,
-        source_draft_id=payload.source_draft_id,
+    selections:   list[TemplateSelectionIn] = Field(
+        ..., min_length=1, max_length=MAX_CHARTS_PER_TEMPLATE,
+        description=f"1..{MAX_CHARTS_PER_TEMPLATE} charts to save in this template",
     )
-    return {"template_id": template_id, "action": "created"}
+
+    model_config = ConfigDict(
+        extra="ignore",
+        json_schema_extra={"example": _EXAMPLE_TEMPLATE},
+    )
 
 
-@router.get("/templates", summary="List templates for a user")
-def list_templates(user_id: str = Query(...), limit: int = Query(default=50, le=200)):
-    return {"templates": db_service.get_templates_by_user(user_id, limit=limit)}
+# ── Helpers ─────────────────────────────────────────────────────────────────
 
+def _selection_script(sel: dict[str, Any]) -> str:
+    """Pull the Python+SQL code from a saved selection.
 
-@router.get("/templates/{template_id}", summary="Fetch one template")
-def get_template(template_id: str):
-    row = db_service.get_template(template_id)
-    if not row:
-        raise HTTPException(status_code=404, detail="Template not found")
-    return row
-
-
-@router.delete("/templates/{template_id}", summary="Delete a template")
-def delete_template(template_id: str):
-    if not db_service.get_template(template_id):
-        raise HTTPException(status_code=404, detail="Template not found")
-    ok = db_service.delete_template(template_id)
-    if not ok:
-        raise HTTPException(status_code=500, detail="Delete failed")
-    return {"template_id": template_id, "deleted": True}
-
-
-def _run_one_script(code: str, timeout_seconds: int = 45) -> dict[str, Any]:
-    """Re-run a single saved Python+SQL script in the sandbox. Returns {status, result, error}."""
-    if not code or not code.strip():
-        return {"status": "error", "error": "Empty script", "result": None}
-    sandbox = PythonSandbox()
-    return sandbox.execute(code, timeout_seconds)
+    Source of truth is `chart.script` — that's where the SSE response puts
+    it and where the canvas/template payloads carry it. Falls back to
+    legacy shapes (top-level `script`, `evidence.code`) for templates
+    saved before the slot model was simplified.
+    """
+    chart = sel.get("chart") or {}
+    return (
+        (chart.get("script") if isinstance(chart, dict) else "")
+        or sel.get("script")
+        or ((sel.get("evidence") or {}).get("code", "") if isinstance(sel.get("evidence"), dict) else "")
+        or ""
+    )
 
 
 def _pick_label_and_value_cols(sample_row: dict) -> tuple[str | None, str | None]:
-    """Find a string-ish 'label' column and a numeric 'value' column.
-
-    Rules:
-      - `value` = the first column whose sample value is numeric (int/float, non-bool)
-      - `label` = the first column whose sample value is NOT the value column
-                  and is either a string OR not numeric
-      - If no numeric column exists, we return (None, None) — caller falls back.
-    """
+    """Find a string label column and a numeric value column in a result row."""
     keys = list(sample_row.keys())
     val_col = None
     for k in keys:
         v = sample_row.get(k)
-        if isinstance(v, bool):   # bool is a subclass of int — skip
+        if isinstance(v, bool):
             continue
         if isinstance(v, (int, float)) and v is not None:
             val_col = k
             break
     if val_col is None:
         return None, None
-
     label_col = None
     for k in keys:
         if k == val_col:
             continue
-        v = sample_row.get(k)
-        if isinstance(v, str):
+        if isinstance(sample_row.get(k), str):
             label_col = k
             break
     if label_col is None:
-        # No explicit string column — fall back to the first non-value column.
         for k in keys:
             if k != val_col:
                 label_col = k
@@ -250,12 +151,11 @@ def _pick_label_and_value_cols(sample_row: dict) -> tuple[str | None, str | None
 
 
 def _rebuild_chart_with_fresh_data(chart: dict[str, Any], fresh: dict[str, Any]) -> dict[str, Any]:
-    """Replace the chart's series data with freshly-fetched rows.
+    """Swap the saved chart's data for freshly-fetched rows.
 
-    Preserves the saved chart's shape (type, title, colors, axes). Only
-    `series[0].data` and `xAxis.categories` (or pie slice shape) get swapped
-    for the new rows. If we cannot find sensible label + value columns in the
-    fresh result, the chart is returned unchanged and flagged in the subtitle.
+    The chart's shape (type, title, colors, axes) is preserved; only series
+    data and xAxis categories (or pie slice array) get replaced. Floats are
+    rounded to 2 decimals, matching the chart agent's rule.
     """
     new_chart = json.loads(json.dumps(chart, default=str))
     new_chart.setdefault("subtitle", {})
@@ -266,7 +166,6 @@ def _rebuild_chart_with_fresh_data(chart: dict[str, Any], fresh: dict[str, Any])
     ).strip()
 
     result = fresh.get("result") if isinstance(fresh, dict) else None
-
     rows = None
     if isinstance(result, dict):
         for k in ("chart_data", "rows", "data", "series", "detail_rows"):
@@ -277,35 +176,30 @@ def _rebuild_chart_with_fresh_data(chart: dict[str, Any], fresh: dict[str, Any])
         rows = result
 
     if not (rows and isinstance(rows[0], dict)):
+        _round_floats(new_chart)
         return new_chart
 
     label_col, val_col = _pick_label_and_value_cols(rows[0])
     if label_col is None or val_col is None:
+        _round_floats(new_chart)
         return new_chart
 
-    # Normalize the chart.type — it can live under `chart.type` or top-level `type`.
     chart_type = (
         (new_chart.get("chart") or {}).get("type")
-        or new_chart.get("type")
-        or ""
+        or new_chart.get("type") or ""
     ).lower()
     series = new_chart.get("series") or []
 
-    # Pie / donut charts need [{name, y}, ...] — check this FIRST, before the
-    # generic branch would overwrite series[0].data with a bare number array.
     if chart_type in ("pie", "donut") and series and isinstance(series[0], dict):
         series[0]["data"] = [
-            {"name": str(r.get(label_col, "")), "y": r.get(val_col)}
-            for r in rows
+            {"name": str(r.get(label_col, "")), "y": r.get(val_col)} for r in rows
         ]
         new_chart["series"] = series
+        _round_floats(new_chart)
         return new_chart
 
-    # Cartesian charts (bar, column, line, area, spline, scatter…): update
-    # xAxis.categories and series[0].data in lockstep.
     categories = [str(r.get(label_col, "")) for r in rows]
     values = [r.get(val_col) for r in rows]
-
     if isinstance(new_chart.get("xAxis"), dict):
         new_chart["xAxis"]["categories"] = categories
     elif isinstance(new_chart.get("xAxis"), list) and new_chart["xAxis"]:
@@ -316,10 +210,90 @@ def _rebuild_chart_with_fresh_data(chart: dict[str, Any], fresh: dict[str, Any])
         series[0]["data"] = values
         new_chart["series"] = series
 
+    _round_floats(new_chart)
     return new_chart
 
 
-@router.post("/templates/{template_id}/run", summary="Re-run all scripts and re-render charts")
+# ── Threads (unchanged — separate concern from templates) ───────────────────
+
+@router.get("/threads", summary="List chat threads for a user")
+def list_threads(user_id: str = Query(...), limit: int = Query(default=50, le=200)):
+    return {"threads": db_service.get_threads_by_user(user_id, limit=limit)}
+
+
+@router.get("/threads/{thread_id}/queries", summary="List queries in a thread")
+def list_thread_queries(thread_id: str, limit: int = Query(default=100, le=500)):
+    return {"thread_id": thread_id, "queries": db_service.get_queries_for_thread(thread_id, limit=limit)}
+
+
+# ── Templates (4 endpoints, no extras) ──────────────────────────────────────
+
+@router.post("/templates", summary="Create OR update (upsert by source_draft_id) a template")
+def create_template(payload: TemplateIn):
+    """Save the canvas as a template.
+
+    If `source_draft_id` is provided AND a template already exists for that
+    draft, the existing template is **updated in place** — clicking "Save to
+    template" twice from the same canvas never produces duplicates. Without
+    `source_draft_id`, always creates a fresh template.
+    """
+    if not payload.selections:
+        raise HTTPException(status_code=400, detail="At least one chart selection is required.")
+    if len(payload.selections) > MAX_CHARTS_PER_TEMPLATE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Max {MAX_CHARTS_PER_TEMPLATE} charts per template, got {len(payload.selections)}.",
+        )
+
+    selections    = [s.dict() for s in payload.selections]
+    last_rendered = {"charts": [s["chart"] for s in selections]}
+    title         = payload.title.strip() or "Untitled report"
+
+    # Upsert by source_draft_id: re-saving the same canvas updates instead
+    # of duplicating. Without source_draft_id this branch is skipped.
+    if payload.source_draft_id:
+        existing = db_service.find_template_by_draft(payload.source_draft_id)
+        if existing:
+            template_id = existing["template_id"]
+            db_service.update_template(
+                template_id=template_id,
+                title=title,
+                project_type=payload.project_type,
+                selections=selections,
+                last_rendered=last_rendered,
+                source_draft_id=payload.source_draft_id,
+            )
+            return {"template_id": template_id, "action": "updated"}
+
+    template_id = str(uuid.uuid4())
+    db_service.create_template(
+        template_id=template_id,
+        user_id=payload.user_id,
+        thread_id=None,
+        title=title,
+        project_type=payload.project_type,
+        selections=selections,
+        last_rendered=last_rendered,
+        source_draft_id=payload.source_draft_id,
+    )
+    return {"template_id": template_id, "action": "created"}
+
+
+@router.get("/templates", summary="List a user's templates")
+def list_templates(user_id: str = Query(...), limit: int = Query(default=50, le=200)):
+    return {"templates": db_service.get_templates_by_user(user_id, limit=limit)}
+
+
+@router.delete("/templates/{template_id}", summary="Delete a template")
+def delete_template(template_id: str):
+    if not db_service.get_template(template_id):
+        raise HTTPException(status_code=404, detail="Template not found")
+    if not db_service.delete_template(template_id):
+        raise HTTPException(status_code=500, detail="Delete failed")
+    return {"template_id": template_id, "deleted": True}
+
+
+@router.post("/templates/{template_id}/run", summary="Re-run the template with today's data")
 def run_template(template_id: str):
     row = db_service.get_template(template_id)
     if not row:
@@ -332,34 +306,28 @@ def run_template(template_id: str):
         except Exception:
             selections = []
 
-    # Respect the stored drag-drop order. Fall back to list index if a
-    # selection predates the `position` field so older templates still work.
-    selections = sorted(
-        selections,
-        key=lambda s: int(s.get("position", 0) if s.get("position") is not None
-                          else selections.index(s)),
-    )
-
-    rendered_charts: list[dict[str, Any]] = []
+    sandbox = PythonSandbox()
+    rendered_selections: list[dict[str, Any]] = []
     script_reports: list[dict[str, Any]] = []
 
     for sel in selections:
         t0 = time.perf_counter()
-        chart = sel.get("chart", {}) or {}
-        evidence = sel.get("evidence") or {}
-        code = evidence.get("code", "") if isinstance(evidence, dict) else ""
+        chart = sel.get("chart") or {}
+        code = _selection_script(sel)
 
-        try:
-            fresh = _run_one_script(code)
-        except Exception as e:
-            fresh = {"status": "error", "error": str(e), "result": None}
+        if not code.strip():
+            fresh = {"status": "error", "error": "Empty script — cannot re-run", "result": None}
+        else:
+            try:
+                fresh = sandbox.execute(code, 45)
+            except Exception as e:
+                fresh = {"status": "error", "error": str(e), "result": None}
 
         elapsed_ms = (time.perf_counter() - t0) * 1000
-
         status = fresh.get("status", "success") if isinstance(fresh, dict) else "success"
         script_reports.append({
             "query_id": sel.get("query_id"),
-            "chart_index": sel.get("chart_index"),
+            "chart_id": (chart.get("chart_id") if isinstance(chart, dict) else None),
             "status": status,
             "error": fresh.get("error", "") if isinstance(fresh, dict) else "",
             "elapsed_ms": round(elapsed_ms, 2),
@@ -367,39 +335,44 @@ def run_template(template_id: str):
 
         if status == "success":
             rebuilt = _rebuild_chart_with_fresh_data(chart, fresh)
-
-            # Refresh the insight block using the original as a style template.
             original_insight = chart.get("insight") if isinstance(chart, dict) else ""
             if original_insight:
-                chart_title = ""
+                title = ""
                 if isinstance(rebuilt.get("title"), dict):
-                    chart_title = rebuilt["title"].get("text", "") or ""
+                    title = rebuilt["title"].get("text", "") or ""
                 elif isinstance(rebuilt.get("title"), str):
-                    chart_title = rebuilt["title"]
-                fresh_result = fresh.get("result") if isinstance(fresh, dict) else None
-                new_insight = refresh_insight(chart_title, original_insight, fresh_result)
-                if new_insight:
-                    rebuilt["insight"] = new_insight
-                    history = rebuilt.get("_insight_history") or []
-                    history.append({
-                        "original_insight": original_insight,
-                        "refreshed_at": time.time(),
-                    })
-                    rebuilt["_insight_history"] = history
-
-            rendered_charts.append(rebuilt)
+                    title = rebuilt["title"]
+                rebuilt["insight"] = refresh_insight(
+                    title, original_insight, fresh.get("result"),
+                )
+            new_chart = rebuilt
         else:
-            # Fallback to the saved chart; mark it in the subtitle so the UI can flag it.
-            stale = json.loads(json.dumps(chart, default=str))
-            sub = stale.get("subtitle") if isinstance(stale.get("subtitle"), dict) else {}
+            new_chart = json.loads(json.dumps(chart, default=str))
+            sub = new_chart.get("subtitle") if isinstance(new_chart.get("subtitle"), dict) else {}
             sub["text"] = ((sub.get("text", "") or "") + "  (refresh failed — showing saved data)").strip()
-            stale["subtitle"] = sub
-            rendered_charts.append(stale)
+            new_chart["subtitle"] = sub
 
+        # Return the WHOLE selection back so the UI can render in the same
+        # spot it was saved. Layout (x/y/w/h/position) is carried verbatim
+        # from the saved selection — only `chart` is the freshly rebuilt one.
+        rendered_selections.append({
+            "query_id":       sel.get("query_id"),
+            "chart_id":       new_chart.get("chart_id"),
+            "original_query": sel.get("original_query", ""),
+            "x":              sel.get("x"),
+            "y":              sel.get("y"),
+            "w":              sel.get("w"),
+            "h":              sel.get("h"),
+            "position":       sel.get("position"),
+            "chart":          new_chart,
+        })
+
+    # Keep `charts` for back-compat with anything that just wants a flat list.
     rendered = {
-        "charts": rendered_charts,
+        "selections":     rendered_selections,
+        "charts":         [s["chart"] for s in rendered_selections],
         "script_reports": script_reports,
-        "rendered_at": time.time(),
+        "rendered_at":    time.time(),
     }
     db_service.update_template_render(template_id, rendered)
     return {"template_id": template_id, **rendered}

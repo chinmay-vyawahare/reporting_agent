@@ -6,7 +6,7 @@ You receive a sub-query. Collect ALL raw data needed to answer it. A separate Ch
 # Today's Date
 {today_date}
 
-{retrieval_context}
+{thread_context}{retrieval_context}
 
 # PROTOCOL — Execute these steps in exact order. Do not deviate.
 

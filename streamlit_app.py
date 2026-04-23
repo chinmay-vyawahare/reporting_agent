@@ -200,15 +200,16 @@ def render_gridstack_canvas(slots: list[dict], draft_id: str, api_base: str,
         y = int(s.get("y", 0) or 0)
         w = int(s.get("w", 6) or 6)
         h = int(s.get("h", 4) or 4)
-        source = s.get("source") or f"{s.get('query_id', '')}:{s.get('chart_index', '')}"
-        chart_json = json.dumps(s.get("chart") or {}, default=str)
+        chart_obj = s.get("chart") or {}
+        cid = chart_obj.get("chart_id") or s.get("source") or ""
+        chart_json = json.dumps(chart_obj, default=str)
         items_html.append(f"""
           <div class="grid-stack-item"
                gs-x="{x}" gs-y="{y}" gs-w="{w}" gs-h="{h}"
-               gs-id="{source}">
+               gs-id="{cid}">
             <div class="grid-stack-item-content tile">
-              <button class="tile-rm" data-source="{source}" title="Remove from canvas">✕</button>
-              <div class="chart-host" id="chart-{source}"></div>
+              <button class="tile-rm" data-source="{cid}" title="Remove from canvas">✕</button>
+              <div class="chart-host" id="chart-{cid}"></div>
               <script type="application/json" class="chart-config">{chart_json}</script>
             </div>
           </div>
@@ -266,7 +267,7 @@ def render_gridstack_canvas(slots: list[dict], draft_id: str, api_base: str,
         const BASE_SLOTS = {slots_payload_json};
         const SLOT_BY_SRC = {{}};
         BASE_SLOTS.forEach(s => {{
-          const src = s.source || (s.query_id + ':' + s.chart_index);
+          const src = (s.chart && s.chart.chart_id) || s.source || '';
           SLOT_BY_SRC[src] = s;
         }});
 
@@ -301,14 +302,14 @@ def render_gridstack_canvas(slots: list[dict], draft_id: str, api_base: str,
           const positions = grid.save(false);  // [{{id, x, y, w, h}}...]
           const byId = Object.fromEntries(positions.map(p => [p.id, p]));
           const newSlots = Object.values(SLOT_BY_SRC).map(s => {{
-            const src = s.source || (s.query_id + ':' + s.chart_index);
+            const src = (s.chart && s.chart.chart_id) || s.source || '';
             const pos = byId[src];
             if (!pos) return s;  // removed
             return Object.assign({{}}, s, {{
               x: pos.x, y: pos.y, w: pos.w, h: pos.h,
             }});
           }}).filter(s => {{
-            const src = s.source || (s.query_id + ':' + s.chart_index);
+            const src = (s.chart && s.chart.chart_id) || s.source || '';
             return byId[src] != null;
           }});
 
@@ -381,26 +382,23 @@ def render_highchart(chart_config: dict, container_key: str, height: int = 380):
 
 # ── Canvas API helpers ──────────────────────────────────────────────────────
 
-def api_list_drafts(user_id: str, thread_id: str | None = None):
-    """Return all drafts for a user. If thread_id is provided, only drafts in
-    that thread. If None, every draft the user has across all threads."""
+def api_list_drafts(user_id: str):
+    """Return every canvas draft this user has — canvas is user-scoped, so
+    a single canvas can mix charts the user gathered across any threads.
+    """
     try:
-        params = {"user_id": user_id}
-        if thread_id:
-            params["thread_id"] = thread_id
-        r = requests.get(f"{API_BASE}/canvas/drafts", params=params, timeout=10)
+        r = requests.get(f"{API_BASE}/canvas/drafts",
+                         params={"user_id": user_id}, timeout=10)
         return r.json().get("drafts", []) if r.status_code == 200 else []
     except Exception:
         return []
 
 
-def api_create_draft(user_id: str, username: str, thread_id: str, name: str, project_type: str):
+def api_create_draft(user_id: str, name: str, project_type: str):
     r = requests.post(
         f"{API_BASE}/canvas/drafts",
         json={
             "user_id":   user_id,
-            "username":  username,
-            "thread_id": thread_id,
             "name":      name,
             "project_type": project_type,
         },
@@ -428,19 +426,6 @@ def api_patch_draft(draft_id: str, name=None, slots=None):
 def api_delete_draft(draft_id: str):
     r = requests.delete(f"{API_BASE}/canvas/drafts/{draft_id}", timeout=10)
     return r.status_code == 200
-
-
-def api_patch_template(template_id: str, **fields):
-    """Partial update on a template (title, selections, etc.)."""
-    body = {k: v for k, v in fields.items() if v is not None}
-    if not body:
-        return None
-    r = requests.patch(f"{API_BASE}/templates/{template_id}",
-                        json=_sanitize_for_json(body), timeout=15)
-    if r.status_code != 200:
-        st.error(f"Update template failed ({r.status_code}): {r.text[:200]}")
-        return None
-    return r.json()
 
 
 def api_list_thread_queries(thread_id: str):
@@ -478,22 +463,80 @@ _init_state()
 
 # ── Sidebar ─────────────────────────────────────────────────────────────────
 
+def _list_threads_for_user(uid: str) -> list[dict]:
+    """Pull every thread this user has, newest first. Empty list on error."""
+    try:
+        r = requests.get(f"{API_BASE}/threads", params={"user_id": uid}, timeout=10)
+        return r.json().get("threads", []) if r.status_code == 200 else []
+    except Exception:
+        return []
+
+
+def _list_queries_in_thread(tid: str) -> list[dict]:
+    try:
+        r = requests.get(f"{API_BASE}/threads/{tid}/queries", timeout=10)
+        return r.json().get("queries", []) if r.status_code == 200 else []
+    except Exception:
+        return []
+
+
 with st.sidebar:
     st.header("Settings")
     user_id = st.text_input("User ID", value="demo_user")
-    username = st.text_input("Username", value="Demo User")
     project_type = st.selectbox("Project Type", options=PROJECT_TYPES, index=0)
     max_charts = st.slider("Max charts per query", 1, 5, 3)
 
     st.divider()
-    st.subheader("Thread")
-    st.caption(f"`{st.session_state.thread_id[:8]}…`")
-    if st.button("New thread", use_container_width=True):
+    if st.button("➕ New thread", use_container_width=True, type="primary"):
         st.session_state.thread_id = str(uuid.uuid4())
         st.session_state.queries = []
         st.session_state.active_draft_id = None
         st.session_state.template_view = None
         st.rerun()
+
+    # ── Past threads — switch in/out, see the Q history ──────────────────
+    st.subheader("💬 Past chats")
+    threads = _list_threads_for_user(user_id)
+    if not threads:
+        st.caption("_No past chats yet — ask something to start one._")
+    else:
+        st.caption(f"{len(threads)} thread(s) for `{user_id}`")
+        for t in threads:
+            tid = t.get("thread_id")
+            is_active = (tid == st.session_state.thread_id)
+            title = (t.get("title") or "").strip() or "(untitled)"
+            updated = str(t.get("updated_at") or "")[:16]   # YYYY-MM-DD HH:MM
+
+            # Cache per-thread Q lists for inactive threads (they don't change),
+            # but always refetch the active thread so a brand-new question
+            # shows up in the sidebar without a manual refresh.
+            cache_key = f"_thread_qs_{tid}"
+            if is_active or cache_key not in st.session_state:
+                st.session_state[cache_key] = _list_queries_in_thread(tid)
+            qs = st.session_state[cache_key]
+
+            label = f"{'🟢' if is_active else '💬'}  {title[:48]}"
+            with st.expander(label, expanded=is_active):
+                st.caption(f"`{tid[:8]}…` · last activity: `{updated}` · {len(qs)} Q")
+                # Show the Q (and a short A preview) for each turn
+                for i, q in enumerate(qs, 1):
+                    qtxt = (q.get("original_query") or "").strip() or "(empty)"
+                    rat  = (q.get("rationale")      or "").strip()
+                    st.markdown(f"**Q{i}.** {qtxt}")
+                    if rat:
+                        st.caption(f"_{rat[:140]}{'…' if len(rat) > 140 else ''}_")
+                # Switch action
+                if not is_active:
+                    if st.button("Open this thread",
+                                 key=f"open_thr_{tid}",
+                                 use_container_width=True):
+                        st.session_state.thread_id = tid
+                        st.session_state.queries = []           # forces rehydrate
+                        st.session_state.active_draft_id = None
+                        st.session_state.template_view = None
+                        st.rerun()
+                else:
+                    st.caption("✅ Currently open in chat.")
 
     st.divider()
     try:
@@ -514,31 +557,30 @@ with st.sidebar:
 
 # ── Rehydrate chat from the DB ──────────────────────────────────────────────
 
+def _fetch_charts_for_query(query_id: str) -> list[dict]:
+    """Pull the chart rows for a query from the new charts table. Returns [] on error."""
+    try:
+        r = requests.get(f"{API_BASE}/charts", params={"query_id": query_id}, timeout=10)
+        return r.json().get("charts", []) if r.status_code == 200 else []
+    except Exception:
+        return []
+
+
 if not st.session_state.queries:
     server_rows = api_list_thread_queries(st.session_state.thread_id)
     rebuilt = []
     for row in server_rows:
-        charts = row.get("charts") or []
-        if isinstance(charts, str):
-            try:
-                charts = json.loads(charts)
-            except Exception:
-                charts = []
-        evidence = row.get("evidence") or []
-        if isinstance(evidence, str):
-            try:
-                evidence = json.loads(evidence)
-            except Exception:
-                evidence = []
+        # Charts no longer live on the queries row — fetch them from the
+        # dedicated reporting_agent_charts table via /charts?query_id=.
+        qid = row.get("query_id") or str(uuid.uuid4())
         rebuilt.append({
-            "query_id":           row.get("query_id") or str(uuid.uuid4()),
+            "query_id":           qid,
             "query":              row.get("original_query") or "",
             "project_type":       row.get("project_type") or "",
-            "charts":             charts,
+            "charts":             _fetch_charts_for_query(qid),
             "rationale":          row.get("rationale") or "",
             "traversal_steps":    row.get("traversal_steps") or 0,
             "traversal_findings": row.get("traversal_findings") or "",
-            "evidence":           evidence,
             "retrieval_nodes":    [],
             "retrieval_paths":    [],
         })
@@ -551,7 +593,7 @@ if not st.session_state.queries:
 # shows up here so they can drop new charts into an old report, not just the
 # one tied to the current chat.
 
-drafts = api_list_drafts(user_id, thread_id=None)
+drafts = api_list_drafts(user_id)
 current_thread = st.session_state.thread_id
 
 # If the stored active_draft_id no longer exists, clear it.
@@ -566,41 +608,35 @@ if not st.session_state.active_draft_id and drafts:
 
 # ── Helpers used by chart cards ─────────────────────────────────────────────
 
-def _slot_source(s: dict) -> str:
-    """Return the stable dedupe key for a slot.
-
-    Older slots (and slots written directly via the API without the UI) may
-    not carry a `source` field — `CanvasSlot` doesn't declare one. The key is
-    always recoverable from query_id + chart_index, so compute it if absent.
-    """
-    sk = s.get("source")
-    if sk:
-        return sk
-    return f"{s.get('query_id', '')}:{s.get('chart_index', '')}"
+def _slot_chart_id(s: dict) -> str:
+    """Return the slot's stable chart_id (lives inside `chart.chart_id`)."""
+    ch = s.get("chart") if isinstance(s, dict) else None
+    return (ch.get("chart_id") if isinstance(ch, dict) else None) or ""
 
 
-def _chart_in_draft(draft: dict, source_key: str) -> bool:
-    return any(_slot_source(s) == source_key for s in (draft.get("slots") or []))
+def _chart_in_draft(draft: dict, chart_id: str) -> bool:
+    return any(_slot_chart_id(s) == chart_id for s in (draft.get("slots") or []))
 
 
 def _add_chart_to_draft(draft: dict, q_rec: dict, chart_idx: int):
     slots = list(draft.get("slots") or [])
     chart = q_rec["charts"][chart_idx]
-    source_key = f"{q_rec['query_id']}:{chart_idx}"
+    cid = chart.get("chart_id") or ""
 
-    if any(_slot_source(s) == source_key for s in slots):
+    if not cid:
+        return False, "Chart has no chart_id (regenerate the report)."
+    if any(_slot_chart_id(s) == cid for s in slots):
         return False, "Already in this draft."
     if len(slots) >= MAX_REPORT_CHARTS:
         return False, f"Draft is full ({MAX_REPORT_CHARTS} max)."
 
+    # CanvasSlot is now: query_id + chart (with chart.script inside) + layout.
+    # The slot-level `script` duplicate was dropped — script lives in chart.
     slots.append({
         "position":       len(slots),
-        "source":         source_key,
         "query_id":       q_rec["query_id"],
-        "chart_index":    chart_idx,
         "original_query": q_rec.get("query", ""),
         "chart":          chart,
-        "evidence":       chart.get("evidence") or {},
     })
     resp = api_patch_draft(draft["draft_id"], slots=slots)
     return resp is not None, "Added."
@@ -613,34 +649,32 @@ def _remove_slot(draft_id: str, slots: list, position: int):
     api_patch_draft(draft_id, slots=new_slots)
 
 
-def _sync_chart_everywhere_in_db(query_id: str, chart_index: int, patched_chart: dict):
-    """Chart edit → propagate into every draft that contains this chart."""
-    # Update the in-session query record
+def _sync_chart_everywhere_in_session(chart_id: str, patched_chart: dict):
+    """Mirror an edited chart into the in-session query records and drafts.
+
+    Server-side propagation is already done by /charts/edit (see
+    db_service.propagate_chart_content), so this function only refreshes the
+    Streamlit caches so the user sees the edit without a hard reload.
+    """
     for q in st.session_state.queries:
-        if q.get("query_id") == query_id:
-            if 0 <= chart_index < len(q.get("charts", [])):
-                q["charts"][chart_index] = patched_chart
-            break
-    source_key = f"{query_id}:{chart_index}"
-    # Propagate to every draft in the thread
+        for i, c in enumerate(q.get("charts", []) or []):
+            if isinstance(c, dict) and c.get("chart_id") == chart_id:
+                q["charts"][i] = patched_chart
     for d in drafts:
         slots = d.get("slots") or []
         if isinstance(slots, str):
             try:
                 slots = json.loads(slots)
             except Exception:
-                slots = []
-        touched = False
+                continue
         for s in slots:
-            if _slot_source(s) == source_key:
+            ch = s.get("chart") if isinstance(s, dict) else None
+            if isinstance(ch, dict) and ch.get("chart_id") == chart_id:
                 s["chart"] = patched_chart
-                touched = True
-        if touched:
-            api_patch_draft(d["draft_id"], slots=slots)
 
 
 @st.dialog("Edit chart")
-def _edit_chart_dialog(query_id: str, chart_index: int, chart_title: str):
+def _edit_chart_dialog(chart_id: str, chart_title: str):
     st.caption(f"Editing: **{chart_title}**")
     st.write(
         "Describe the change in plain English. Examples:\n"
@@ -651,7 +685,7 @@ def _edit_chart_dialog(query_id: str, chart_index: int, chart_title: str):
     instruction = st.text_area(
         "Your edit",
         placeholder="e.g., change the color of the bars to red",
-        key=f"edit_input_{query_id}_{chart_index}",
+        key=f"edit_input_{chart_id}",
         height=100,
     )
     ca, cb = st.columns([1, 1])
@@ -668,14 +702,14 @@ def _edit_chart_dialog(query_id: str, chart_index: int, chart_title: str):
             with st.spinner("Patching the chart config..."):
                 resp = requests.post(
                     f"{API_BASE}/charts/edit",
-                    json={"query_id": query_id, "chart_index": chart_index, "instruction": instruction.strip()},
+                    json={"chart_id": chart_id, "instruction": instruction.strip()},
                     timeout=90,
                 )
             if resp.status_code != 200:
                 st.error(f"Edit failed ({resp.status_code}): {resp.text[:300]}")
                 st.stop()
             patched = (resp.json() or {}).get("chart") or {}
-            _sync_chart_everywhere_in_db(query_id, chart_index, patched)
+            _sync_chart_everywhere_in_session(chart_id, patched)
             st.success("Edit applied and saved.")
             st.rerun()
         except Exception as e:
@@ -689,7 +723,6 @@ def _run_query(query: str):
         "query": query.strip(),
         "project_type": project_type,
         "user_id": user_id,
-        "username": username,
         "max_charts": max_charts,
         "thread_id": st.session_state.thread_id,
     })
@@ -720,7 +753,7 @@ def _run_query(query: str):
                     status.info(f"Query started (ID: {query_id[:8] if query_id else '?'}…)")
                 elif current_event == "step":
                     step = data.get("step", 0)
-                    total = data.get("total", 4)
+                    total = data.get("total", 3)
                     progress.progress(min(step / (total + 1), 0.99), text=data.get("label", "..."))
                 elif current_event == "retrieval_done":
                     status.info(f"Retrieval: {data.get('nodes', 0)} nodes · {data.get('paths', 0)} paths "
@@ -742,17 +775,14 @@ def _run_query(query: str):
 
         progress.progress(1.0, text="Complete")
         status.empty()
+        # SSE complete payload is slim now: just charts + rationale + errors.
+        # Each chart already carries chart_id + script + insight + colors etc.
         st.session_state.queries.append({
-            "query_id": query_id or str(uuid.uuid4()),
-            "query": query.strip(),
+            "query_id":     query_id or str(uuid.uuid4()),
+            "query":        query.strip(),
             "project_type": project_type,
-            "charts": result_payload.get("charts", []),
-            "rationale": result_payload.get("rationale", ""),
-            "traversal_steps": result_payload.get("traversal_steps", 0),
-            "traversal_findings": result_payload.get("traversal_findings", ""),
-            "evidence": result_payload.get("evidence", []),
-            "retrieval_nodes": result_payload.get("retrieval_nodes", []),
-            "retrieval_paths": result_payload.get("retrieval_paths", []),
+            "charts":       result_payload.get("charts", []),
+            "rationale":    result_payload.get("rationale", ""),
         })
 
     except requests.exceptions.ConnectionError:
@@ -789,10 +819,13 @@ def _render_chart_card(q_rec: dict, chart: dict, idx: int, active_draft: dict | 
 
     render_insight(chart.get("insight"))
 
-    ev = chart.get("evidence") or {}
-    code = ev.get("code") or "(no script captured)"
+    # Script is now a top-level field on the chart object itself.
+    code = chart.get("script") or "(no script captured)"
     with st.expander("🐍 Python + SQL script"):
         st.code(code, language="python")
+    # Legacy evidence rows blob — only show if it happens to be present
+    # (not in the slim SSE response, but old session caches may carry it).
+    ev = chart.get("evidence") or {}
     with st.expander("🗂 Evidence — data used"):
         result = ev.get("result")
         if isinstance(result, (dict, list)):
@@ -860,10 +893,7 @@ def _render_chart_card(q_rec: dict, chart: dict, idx: int, active_draft: dict | 
             if not new_name.strip():
                 st.warning("Give the new draft a name first.")
             else:
-                row = api_create_draft(
-                    user_id, username, st.session_state.thread_id,
-                    new_name.strip(), project_type,
-                )
+                row = api_create_draft(user_id, new_name.strip(), project_type)
                 if row:
                     ok, msg = _add_chart_to_draft(row, q_rec, idx)
                     st.session_state.active_draft_id = row["draft_id"]
@@ -954,8 +984,7 @@ with tab_canvas_pane:
                 if not new_name.strip():
                     st.warning("Give the draft a name.")
                 else:
-                    row = api_create_draft(user_id, username, st.session_state.thread_id,
-                                           new_name.strip(), project_type)
+                    row = api_create_draft(user_id, new_name.strip(), project_type)
                     if row:
                         st.session_state.active_draft_id = row["draft_id"]
                         st.toast(f"Created “{new_name.strip()}”", icon="✅")
@@ -1090,21 +1119,26 @@ with tab_canvas_pane:
             # reporting_agent_queries.charts[idx] and propagates back into
             # every draft + linked template that holds this chart.
             sorted_slots = sorted(slots, key=lambda x: (int(x.get("y", 0)), int(x.get("x", 0))))
-            slot_titles = {}
+            # chart_id is the only handle the chart-edit API takes now.
+            slot_titles: dict[str, str] = {}
             for s in sorted_slots:
-                t = ((s.get("chart") or {}).get("title") or {}).get("text") if isinstance(
-                    (s.get("chart") or {}).get("title"), dict) else (s.get("chart") or {}).get("title")
-                slot_titles[_slot_source(s)] = t or "Chart"
+                cid = _slot_chart_id(s)
+                if not cid:
+                    continue
+                ch = s.get("chart") or {}
+                title_obj = ch.get("title")
+                t = (title_obj.get("text") if isinstance(title_obj, dict) else title_obj) or "Chart"
+                slot_titles[cid] = t
 
             with st.container(border=True):
                 st.markdown("##### ✏️ Edit a chart on the canvas")
                 ed_sel, ed_btn = st.columns([4, 1])
                 with ed_sel:
-                    sk_options = list(slot_titles.keys())
-                    picked_sk = st.selectbox(
+                    cid_options = list(slot_titles.keys())
+                    picked_cid = st.selectbox(
                         "Which chart?",
-                        options=sk_options,
-                        format_func=lambda sk: f"{slot_titles[sk]}",
+                        options=cid_options,
+                        format_func=lambda cid: f"{slot_titles[cid]}",
                         key=f"edit_slot_pick_{active_draft['draft_id']}",
                         label_visibility="collapsed",
                     )
@@ -1113,14 +1147,8 @@ with tab_canvas_pane:
                                  key=f"edit_slot_btn_{active_draft['draft_id']}",
                                  use_container_width=True,
                                  help="Open the natural-language edit dialog for the picked chart"):
-                        picked_slot = next((s for s in sorted_slots
-                                            if _slot_source(s) == picked_sk), None)
-                        if picked_slot:
-                            _edit_chart_dialog(
-                                picked_slot["query_id"],
-                                picked_slot["chart_index"],
-                                slot_titles[picked_sk],
-                            )
+                        if picked_cid:
+                            _edit_chart_dialog(picked_cid, slot_titles[picked_cid])
 
                 st.caption("_Changes also update the same chart in the chat and in any finalized "
                            "template linked to this canvas._")
@@ -1128,29 +1156,27 @@ with tab_canvas_pane:
             # ── Per-tile details panel with inline edit buttons ───────────
             with st.expander("📋 Slot details (insight · script · edit)"):
                 for s in sorted_slots:
+                    cid = _slot_chart_id(s)
+                    title = slot_titles.get(cid, "Chart")
                     cols_hdr, cols_edit = st.columns([5, 1])
                     with cols_hdr:
                         st.markdown(
                             f"**[{s.get('x', 0)},{s.get('y', 0)}] "
-                            f"{s.get('w', '?')}×{s.get('h', '?')}** · "
-                            f"{slot_titles[_slot_source(s)]}"
+                            f"{s.get('w', '?')}×{s.get('h', '?')}** · {title}"
                         )
                     with cols_edit:
-                        if st.button(
+                        if cid and st.button(
                             "✏️ Edit",
-                            key=f"edit_slot_inline_{active_draft['draft_id']}_{_slot_source(s)}",
+                            key=f"edit_slot_inline_{active_draft['draft_id']}_{cid}",
                             use_container_width=True,
                         ):
-                            _edit_chart_dialog(
-                                s["query_id"],
-                                s["chart_index"],
-                                slot_titles[_slot_source(s)],
-                            )
+                            _edit_chart_dialog(cid, title)
                     slot_insight = (s.get("chart") or {}).get("insight")
                     if slot_insight:
                         render_insight(slot_insight, header="💡 Insight")
-                    ev = s.get("evidence") or {}
-                    st.code(ev.get("code") or "(no script)", language="python")
+                    # Script is now inside chart, not a separate `evidence` field.
+                    script = (s.get("chart") or {}).get("script") or "(no script)"
+                    st.code(script, language="python")
                     # Show edit history (if any) so the user sees what's been
                     # applied to this chart over time.
                     history = (s.get("chart") or {}).get("_edit_history") or []
@@ -1190,20 +1216,25 @@ with tab_canvas_pane:
             # `slots` is already sorted by .position from the drag-drop handler.
             # `source_draft_id` links the finalized template back to this
             # canvas so later layout changes propagate automatically.
+            # Templates are user-scoped, not thread-scoped (canvas can mix
+            # charts from any thread). Only send source_draft_id so the
+            # server can upsert by draft.
             payload = {
-                "user_id": user_id,
-                "username": username,
-                "thread_id": st.session_state.thread_id,
-                "title": ftitle,
-                "project_type": project_type,
+                "user_id":         user_id,
+                "title":           ftitle,
+                "project_type":    project_type,
                 "source_draft_id": active_draft["draft_id"],
                 "selections": [
                     {
-                        "position": s.get("position", i),
-                        "query_id": s["query_id"],
-                        "chart_index": s["chart_index"],
-                        "chart": s["chart"],
-                        "evidence": s.get("evidence") or {},
+                        # TemplateSelectionIn = query_id + chart + layout.
+                        # `chart.script` lives inside chart and is required.
+                        "position":       s.get("position", i),
+                        "x":              s.get("x"),
+                        "y":              s.get("y"),
+                        "w":              s.get("w"),
+                        "h":              s.get("h"),
+                        "query_id":       s["query_id"],
+                        "chart":          s["chart"],
                         "original_query": s.get("original_query", ""),
                     } for i, s in enumerate(slots)
                 ],
@@ -1279,27 +1310,10 @@ with tab_templates_pane:
                 f"</div></div>",
                 unsafe_allow_html=True,
             )
-            # Rename row — inline text input + Save button
-            ren_col, save_col = st.columns([5, 1])
-            with ren_col:
-                renamed = st.text_input(
-                    "Rename template", value=t_title,
-                    key=f"tpl_rename_input_{t_tid}",
-                    label_visibility="collapsed",
-                )
-            with save_col:
-                if st.button("💾 Save", key=f"tpl_rename_save_{t_tid}",
-                             use_container_width=True,
-                             disabled=not renamed.strip() or renamed.strip() == t_title,
-                             help="Save the new template name"):
-                    if api_patch_template(t_tid, title=renamed.strip()):
-                        st.toast("Renamed.", icon="✏️")
-                        st.rerun()
-
             col_open, col_run, col_del = st.columns([3, 2, 1])
             with col_open:
                 if not is_open:
-                    if st.button(f"Open “{(renamed or t_title)[:30]}”",
+                    if st.button(f"Open “{t_title[:30]}”",
                                  key=f"tpl_card_open_{t_tid}", use_container_width=True):
                         st.session_state.template_view = t_tid
                         st.rerun()
@@ -1350,12 +1364,9 @@ with tab_templates_pane:
         st.divider()
 
         # ── Render the currently-open template below the list ───────────
-        try:
-            mr = requests.get(f"{API_BASE}/templates/{tid}", timeout=15)
-            meta = mr.json() if mr.status_code == 200 else {}
-        except Exception as e:
-            meta = {}
-            st.error(f"Could not load template: {e}")
+        # Single-template GET endpoint was dropped server-side — pick the
+        # current one out of the list we already fetched for the badge.
+        meta = next((t for t in tpls if t["template_id"] == tid), {})
 
         if meta:
             st.markdown(f"### 📄 {meta.get('title', '')}")
@@ -1440,10 +1451,10 @@ with tab_templates_pane:
                                       if (chart.get("_insight_history") or [])
                                       else "💡 Insight")
                             render_insight(ins, header=header)
-                        ev = (sel or {}).get("evidence") or {}
+                        # Script lives inside chart now (chart.script);
+                        # legacy evidence shape kept as a fallback.
+                        sel_chart = (sel or {}).get("chart") or {}
+                        script = sel_chart.get("script") or ((sel or {}).get("evidence") or {}).get("code") or "(no script)"
                         st.markdown("**🐍 Python + SQL**")
-                        st.code(ev.get("code") or "(no script)", language="python")
-                        if ev.get("result") is not None:
-                            with st.expander("🗂 Evidence rows (saved snapshot)"):
-                                st.json(ev.get("result"))
+                        st.code(script, language="python")
                         st.divider()

@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import logging
-import uuid
 
 import psycopg2
 
@@ -46,17 +45,17 @@ def ensure_tables() -> None:
     Create all required tables in pwc_agent_utility_schema if they do not exist.
     Called once at application startup.
     """
-    # Base table for queries — kept minimal so it succeeds on fresh installs.
+    # Query metadata only — no `charts` JSONB. Each chart lives as its own
+    # row in reporting_agent_charts so we get real columns to query against.
     create_queries = f"""
         CREATE TABLE IF NOT EXISTS {_SCHEMA}.reporting_agent_queries (
             query_id            VARCHAR(100)    PRIMARY KEY,
             user_id             VARCHAR(100)    NOT NULL,
-            username            VARCHAR(255)    NOT NULL,
+            thread_id           VARCHAR(100),
             original_query      TEXT            NOT NULL,
             project_type        VARCHAR(50)     NOT NULL,
             max_charts          SMALLINT        NOT NULL DEFAULT 3,
             status              VARCHAR(20)     NOT NULL DEFAULT 'running',
-            charts              JSONB,
             rationale           TEXT,
             traversal_findings  TEXT,
             traversal_steps     SMALLINT        DEFAULT 0,
@@ -65,34 +64,47 @@ def ensure_tables() -> None:
             completed_at        TIMESTAMP,
             duration_ms         NUMERIC(12, 2)
         );
-    """
-
-    # Add any new columns on top of the base (idempotent).
-    migration_ddl = f"""
-        ALTER TABLE {_SCHEMA}.reporting_agent_queries
-            ADD COLUMN IF NOT EXISTS thread_id VARCHAR(100);
-        ALTER TABLE {_SCHEMA}.reporting_agent_queries
-            ADD COLUMN IF NOT EXISTS evidence JSONB;
 
         CREATE INDEX IF NOT EXISTS idx_queries_user_thread
             ON {_SCHEMA}.reporting_agent_queries (user_id, thread_id, started_at DESC);
     """
 
-    # Template linkage to source draft (for live layout propagation).
-    template_migration_ddl = f"""
-        ALTER TABLE {_SCHEMA}.reporting_templates
-            ADD COLUMN IF NOT EXISTS source_draft_id VARCHAR(100);
+    # One row per generated chart. The Highcharts config (`chart_config`)
+    # stays JSONB because Highcharts options are deeply nested and arbitrary,
+    # but every metadata field that's worth filtering or joining on
+    # (chart_id, query_id, user_id, thread_id, title, type, script,
+    # description, insight) lives in its own column.
+    # All TEXT fields are unbounded — nothing is truncated.
+    create_charts = f"""
+        CREATE TABLE IF NOT EXISTS {_SCHEMA}.reporting_agent_charts (
+            chart_id        VARCHAR(100)    PRIMARY KEY,
+            query_id        VARCHAR(100)    NOT NULL,
+            user_id         VARCHAR(100)    NOT NULL,
+            thread_id       VARCHAR(100),
+            chart_index     SMALLINT        NOT NULL DEFAULT 0,
+            chart_type      VARCHAR(50),
+            title           TEXT,
+            description     TEXT,
+            insight         TEXT,
+            script          TEXT            NOT NULL,
+            sql_index       SMALLINT,
+            chart_config    JSONB           NOT NULL,
+            created_at      TIMESTAMP       NOT NULL DEFAULT NOW(),
+            updated_at      TIMESTAMP       NOT NULL DEFAULT NOW()
+        );
 
-        CREATE INDEX IF NOT EXISTS idx_templates_source_draft
-            ON {_SCHEMA}.reporting_templates (source_draft_id);
+        CREATE INDEX IF NOT EXISTS idx_charts_user_created
+            ON {_SCHEMA}.reporting_agent_charts (user_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_charts_thread_created
+            ON {_SCHEMA}.reporting_agent_charts (thread_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_charts_query
+            ON {_SCHEMA}.reporting_agent_charts (query_id, chart_index);
     """
 
-    # New tables.
     create_threads = f"""
         CREATE TABLE IF NOT EXISTS {_SCHEMA}.reporting_chat_threads (
             thread_id       VARCHAR(100)    PRIMARY KEY,
             user_id         VARCHAR(100)    NOT NULL,
-            username        VARCHAR(255)    NOT NULL,
             title           TEXT,
             project_type    VARCHAR(50),
             created_at      TIMESTAMP       NOT NULL DEFAULT NOW(),
@@ -107,22 +119,22 @@ def ensure_tables() -> None:
         CREATE TABLE IF NOT EXISTS {_SCHEMA}.reporting_chart_edits (
             edit_id         BIGSERIAL PRIMARY KEY,
             query_id        VARCHAR(100) NOT NULL,
-            chart_index     SMALLINT     NOT NULL,
+            chart_id        VARCHAR(100) NOT NULL,
             instruction     TEXT         NOT NULL,
             patched_chart   JSONB        NOT NULL,
             created_at      TIMESTAMP    NOT NULL DEFAULT NOW()
         );
 
-        CREATE INDEX IF NOT EXISTS idx_chart_edits_query
-            ON {_SCHEMA}.reporting_chart_edits (query_id, chart_index, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_chart_edits_chart
+            ON {_SCHEMA}.reporting_chart_edits (chart_id, created_at DESC);
     """
 
+    # Canvas drafts are USER-scoped (not thread-scoped) — a draft can hold
+    # charts the user gathered from any number of threads.
     create_canvas_drafts = f"""
         CREATE TABLE IF NOT EXISTS {_SCHEMA}.reporting_canvas_drafts (
             draft_id        VARCHAR(100) PRIMARY KEY,
             user_id         VARCHAR(100) NOT NULL,
-            username        VARCHAR(255) NOT NULL,
-            thread_id       VARCHAR(100),
             name            TEXT         NOT NULL,
             project_type    VARCHAR(50),
             slots           JSONB        NOT NULL DEFAULT '[]'::jsonb,
@@ -130,16 +142,16 @@ def ensure_tables() -> None:
             updated_at      TIMESTAMP    NOT NULL DEFAULT NOW()
         );
 
-        CREATE INDEX IF NOT EXISTS idx_canvas_drafts_user_thread
-            ON {_SCHEMA}.reporting_canvas_drafts (user_id, thread_id, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_canvas_drafts_user_updated
+            ON {_SCHEMA}.reporting_canvas_drafts (user_id, updated_at DESC);
     """
 
     create_templates = f"""
         CREATE TABLE IF NOT EXISTS {_SCHEMA}.reporting_templates (
             template_id       VARCHAR(100)    PRIMARY KEY,
             user_id           VARCHAR(100)    NOT NULL,
-            username          VARCHAR(255)    NOT NULL,
             thread_id         VARCHAR(100),
+            source_draft_id   VARCHAR(100),
             title             TEXT            NOT NULL,
             project_type      VARCHAR(50),
             selections        JSONB           NOT NULL,
@@ -150,18 +162,19 @@ def ensure_tables() -> None:
 
         CREATE INDEX IF NOT EXISTS idx_templates_user_created
             ON {_SCHEMA}.reporting_templates (user_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_templates_source_draft
+            ON {_SCHEMA}.reporting_templates (source_draft_id);
     """
 
     try:
         with _conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(create_queries)
-                cur.execute(migration_ddl)
+                cur.execute(create_charts)
                 cur.execute(create_threads)
                 cur.execute(create_chart_edits)
                 cur.execute(create_canvas_drafts)
                 cur.execute(create_templates)
-                cur.execute(template_migration_ddl)
         logger.info("reporting tables verified / created.")
     except Exception as exc:
         logger.error("ensure_tables failed: %s", exc)
@@ -203,7 +216,6 @@ def _fetch_row(sql: str, params: tuple) -> dict | None:
 def create_query(
     query_id: str,
     user_id: str,
-    username: str,
     original_query: str,
     project_type: str,
     max_charts: int = 3,
@@ -213,12 +225,110 @@ def create_query(
     _exec(
         f"""
         INSERT INTO {_SCHEMA}.reporting_agent_queries
-            (query_id, user_id, username, thread_id, original_query, project_type,
+            (query_id, user_id, thread_id, original_query, project_type,
              max_charts, started_at, status)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), 'running')
+        VALUES (%s, %s, %s, %s, %s, %s, NOW(), 'running')
         """,
-        (query_id, user_id, username, thread_id, original_query, project_type, max_charts),
+        (query_id, user_id, thread_id, original_query, project_type, max_charts),
     )
+
+
+_CHART_PERSIST_KEYS = {
+    "chart_id", "chart", "title", "subtitle", "series", "xAxis", "yAxis",
+    "plotOptions", "legend", "tooltip", "colors", "description", "insight",
+    "script", "sql_index",
+}
+
+
+def _chart_for_storage(chart: dict) -> dict:
+    """Build the slim chart object that goes into `chart_config` JSONB.
+
+    Drops the bulky `evidence` blob (raw row dump used only for debugging),
+    lifts `evidence.code` → top-level `script`, and lifts `evidence.sql_index`
+    → top-level `sql_index`. Result mirrors what /report/stream emits.
+    """
+    out = {k: v for k, v in chart.items() if k in _CHART_PERSIST_KEYS}
+    ev = chart.get("evidence")
+    if isinstance(ev, dict):
+        if not out.get("script"):
+            out["script"] = ev.get("code", "")
+        if out.get("sql_index") is None:
+            out["sql_index"] = ev.get("sql_index")
+    return out
+
+
+def _extract_chart_meta(chart: dict, fallback_index: int) -> dict:
+    """Pull queryable metadata out of a chart object so each field lands in
+    its own column. Anything missing falls back to safe defaults."""
+    ch = chart.get("chart") if isinstance(chart.get("chart"), dict) else {}
+    title_obj = chart.get("title") if isinstance(chart.get("title"), dict) else {}
+    ev = chart.get("evidence") if isinstance(chart.get("evidence"), dict) else {}
+    return {
+        "chart_id":    chart.get("chart_id") or "",
+        "chart_index": int(chart.get("chart_index", fallback_index) or fallback_index),
+        "chart_type":  (ch.get("type") if isinstance(ch, dict) else None) or chart.get("type"),
+        "title":       (title_obj.get("text") if isinstance(title_obj, dict) else None)
+                       or (chart.get("title") if isinstance(chart.get("title"), str) else None),
+        "description": chart.get("description"),
+        "insight":     chart.get("insight"),
+        "script":      chart.get("script") or ev.get("code", ""),
+        "sql_index":   chart.get("sql_index") or chart.get("evidence_sql_index") or ev.get("sql_index"),
+    }
+
+
+def save_chart(
+    query_id: str,
+    user_id: str,
+    thread_id: str | None,
+    chart: dict,
+    fallback_index: int = 0,
+) -> bool:
+    """Insert (or upsert) one chart row keyed by chart_id.
+
+    The full Highcharts config is preserved as `chart_config` JSONB; queryable
+    metadata is extracted into proper columns. Nothing is truncated.
+    """
+    meta = _extract_chart_meta(chart, fallback_index)
+    if not meta["chart_id"]:
+        logger.warning("save_chart skipped — chart has no chart_id (query_id=%s)", query_id)
+        return False
+    if not meta["script"]:
+        logger.warning("save_chart: chart_id=%s has no script — re-run will fail later",
+                       meta["chart_id"])
+
+    # Persist a slim chart_config — the bulky evidence-rows blob stays in
+    # memory only. The re-run reads `script` straight from chart_config.
+    storage_chart = _chart_for_storage(chart)
+    try:
+        _exec(
+            f"""
+            INSERT INTO {_SCHEMA}.reporting_agent_charts
+                (chart_id, query_id, user_id, thread_id,
+                 chart_index, chart_type, title, description, insight,
+                 script, sql_index, chart_config, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, NOW(), NOW())
+            ON CONFLICT (chart_id) DO UPDATE SET
+                chart_type   = EXCLUDED.chart_type,
+                title        = EXCLUDED.title,
+                description  = EXCLUDED.description,
+                insight      = EXCLUDED.insight,
+                script       = EXCLUDED.script,
+                sql_index    = EXCLUDED.sql_index,
+                chart_config = EXCLUDED.chart_config,
+                updated_at   = NOW()
+            """,
+            (
+                meta["chart_id"], query_id, user_id, thread_id,
+                meta["chart_index"], meta["chart_type"], meta["title"],
+                meta["description"], meta["insight"],
+                meta["script"], meta["sql_index"],
+                json.dumps(sanitize_for_json(storage_chart), default=str),
+            ),
+        )
+        return True
+    except Exception as exc:
+        logger.error("save_chart failed for chart_id=%s: %s", meta["chart_id"], exc)
+        return False
 
 
 def update_query_complete(
@@ -229,16 +339,23 @@ def update_query_complete(
     traversal_steps: int,
     duration_ms: float,
     errors: list[str] | None = None,
-    evidence: list[dict] | None = None,
+    evidence: list[dict] | None = None,  # accepted but no longer persisted
 ) -> None:
-    """Finalize a completed query with chart results."""
+    """Finalize a completed query.
+
+    Updates the query metadata row, then inserts one row per chart into
+    reporting_agent_charts. The `evidence` parameter is accepted for caller
+    compatibility but no longer stored — evidence.code now lives as `script`
+    on each chart row.
+    """
+    del evidence  # accepted for caller compat, no longer persisted
+
+    # 1) Update the query metadata row.
     _exec(
         f"""
         UPDATE {_SCHEMA}.reporting_agent_queries SET
             status              = 'complete',
-            charts              = %s,
             rationale           = %s,
-            evidence            = %s,
             traversal_findings  = %s,
             traversal_steps     = %s,
             errors              = %s,
@@ -247,11 +364,7 @@ def update_query_complete(
         WHERE query_id = %s
         """,
         (
-            json.dumps(sanitize_for_json(charts), default=str),
             rationale,
-            # Always store evidence as a JSON array (never NULL) — the UI's
-            # rehydration + downstream re-run both read `evidence[*].code`.
-            json.dumps(sanitize_for_json(evidence or []), default=str),
             traversal_findings,
             traversal_steps,
             json.dumps(errors) if errors else None,
@@ -259,6 +372,23 @@ def update_query_complete(
             query_id,
         ),
     )
+    # 2) Persist each chart as its own row. user_id+thread_id come from the
+    #    queries row we just updated.
+    ctx = _fetch_row(
+        f"SELECT user_id, thread_id FROM {_SCHEMA}.reporting_agent_queries WHERE query_id = %s",
+        (query_id,),
+    )
+    if not ctx:
+        logger.warning("update_query_complete: query_id %s not found, charts not saved", query_id)
+        return
+    for i, c in enumerate(charts or []):
+        save_chart(
+            query_id=query_id,
+            user_id=ctx["user_id"],
+            thread_id=ctx.get("thread_id"),
+            chart=c,
+            fallback_index=i,
+        )
 
 
 def update_query_error(
@@ -299,8 +429,8 @@ def get_queries_by_user(user_id: str, limit: int = 50) -> list[dict]:
     return _fetch_rows(
         f"""
         SELECT
-            query_id, user_id, username, original_query, project_type,
-            max_charts, status, charts, rationale, traversal_findings,
+            query_id, user_id, original_query, project_type,
+            max_charts, status, rationale, traversal_findings,
             traversal_steps, errors, started_at, completed_at, duration_ms
         FROM {_SCHEMA}.reporting_agent_queries
         WHERE user_id = %s
@@ -316,8 +446,8 @@ def get_query(query_id: str) -> dict | None:
     return _fetch_row(
         f"""
         SELECT
-            query_id, user_id, username, original_query, project_type,
-            max_charts, status, charts, rationale, traversal_findings,
+            query_id, user_id, original_query, project_type,
+            max_charts, status, rationale, traversal_findings,
             traversal_steps, errors, started_at, completed_at, duration_ms
         FROM {_SCHEMA}.reporting_agent_queries
         WHERE query_id = %s
@@ -331,8 +461,8 @@ def get_all_queries(limit: int = 100) -> list[dict]:
     return _fetch_rows(
         f"""
         SELECT
-            query_id, user_id, username, original_query, project_type,
-            max_charts, status, charts, rationale, traversal_findings,
+            query_id, user_id, original_query, project_type,
+            max_charts, status, rationale, traversal_findings,
             traversal_steps, errors, started_at, completed_at, duration_ms
         FROM {_SCHEMA}.reporting_agent_queries
         ORDER BY started_at DESC
@@ -349,7 +479,6 @@ def get_all_queries(limit: int = 100) -> list[dict]:
 def ensure_thread(
     thread_id: str,
     user_id: str,
-    username: str,
     project_type: str = "",
     title: str | None = None,
 ) -> None:
@@ -357,8 +486,8 @@ def ensure_thread(
     _exec(
         f"""
         INSERT INTO {_SCHEMA}.reporting_chat_threads
-            (thread_id, user_id, username, title, project_type, created_at, updated_at)
-        VALUES (%s, %s, %s, %s, %s, NOW(), NOW())
+            (thread_id, user_id, title, project_type, created_at, updated_at)
+        VALUES (%s, %s, %s, %s, NOW(), NOW())
         ON CONFLICT (thread_id) DO UPDATE
             SET updated_at = NOW(),
                 title = COALESCE(
@@ -366,14 +495,14 @@ def ensure_thread(
                     EXCLUDED.title
                 )
         """,
-        (thread_id, user_id, username, title, project_type),
+        (thread_id, user_id, title, project_type),
     )
 
 
 def get_threads_by_user(user_id: str, limit: int = 50) -> list[dict]:
     return _fetch_rows(
         f"""
-        SELECT thread_id, user_id, username, title, project_type,
+        SELECT thread_id, user_id, title, project_type,
                created_at, updated_at
         FROM {_SCHEMA}.reporting_chat_threads
         WHERE user_id = %s
@@ -385,11 +514,13 @@ def get_threads_by_user(user_id: str, limit: int = 50) -> list[dict]:
 
 
 def get_queries_for_thread(thread_id: str, limit: int = 50) -> list[dict]:
+    """Return query rows for a thread. Charts are NOT inlined here — pull
+    them via `get_charts_for_query(query_id)` when you actually need them."""
     return _fetch_rows(
         f"""
         SELECT
-            query_id, user_id, username, thread_id, original_query, project_type,
-            max_charts, status, charts, rationale, evidence,
+            query_id, user_id, thread_id, original_query, project_type,
+            max_charts, status, rationale,
             traversal_findings, traversal_steps, errors,
             started_at, completed_at, duration_ms
         FROM {_SCHEMA}.reporting_agent_queries
@@ -408,7 +539,6 @@ def get_queries_for_thread(thread_id: str, limit: int = 50) -> list[dict]:
 def create_template(
     template_id: str,
     user_id: str,
-    username: str,
     thread_id: str | None,
     title: str,
     project_type: str,
@@ -419,15 +549,14 @@ def create_template(
     _exec(
         f"""
         INSERT INTO {_SCHEMA}.reporting_templates
-            (template_id, user_id, username, thread_id, title, project_type,
+            (template_id, user_id, thread_id, title, project_type,
              source_draft_id,
              selections, last_rendered, created_at, last_run_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
         """,
         (
             template_id,
             user_id,
-            username,
             thread_id,
             title,
             project_type,
@@ -493,7 +622,7 @@ def find_template_by_draft(source_draft_id: str) -> dict | None:
     or None if none exists. Used for upsert-by-draft semantics."""
     return _fetch_row(
         f"""
-        SELECT template_id, user_id, username, thread_id, source_draft_id,
+        SELECT template_id, user_id, thread_id, source_draft_id,
                title, project_type, selections, last_rendered,
                created_at, last_run_at
         FROM {_SCHEMA}.reporting_templates
@@ -519,7 +648,7 @@ def update_template_render(template_id: str, last_rendered: dict) -> None:
 def get_template(template_id: str) -> dict | None:
     return _fetch_row(
         f"""
-        SELECT template_id, user_id, username, thread_id, title, project_type,
+        SELECT template_id, user_id, thread_id, title, project_type,
                selections, last_rendered, created_at, last_run_at
         FROM {_SCHEMA}.reporting_templates
         WHERE template_id = %s
@@ -531,7 +660,7 @@ def get_template(template_id: str) -> dict | None:
 def get_templates_by_user(user_id: str, limit: int = 50) -> list[dict]:
     return _fetch_rows(
         f"""
-        SELECT template_id, user_id, username, thread_id, title, project_type,
+        SELECT template_id, user_id, thread_id, title, project_type,
                selections, last_rendered, created_at, last_run_at
         FROM {_SCHEMA}.reporting_templates
         WHERE user_id = %s
@@ -542,17 +671,16 @@ def get_templates_by_user(user_id: str, limit: int = 50) -> list[dict]:
     )
 
 
-def propagate_chart_content(query_id: str, chart_index: int, patched_chart: dict) -> dict[str, int]:
-    """When a chart is edited (via POST /charts/edit), write the new chart
-    content into every canvas draft and every template that contains this
-    (query_id, chart_index). Keeps positional fields (x/y/w/h/position) on
-    each slot/selection intact — only the `chart` payload is replaced.
+def propagate_chart_content(chart_id: str, patched_chart: dict) -> dict[str, int]:
+    """When a chart is edited, write the new chart content into every canvas
+    draft and every template that carries a slot/selection whose
+    `chart.chart_id` matches. Layout fields stay intact — only the `chart`
+    payload is replaced.
 
     Returns {"drafts": n_drafts, "templates": n_templates}.
     """
     counts = {"drafts": 0, "templates": 0}
-
-    if patched_chart is None:
+    if patched_chart is None or not chart_id:
         return counts
 
     try:
@@ -564,18 +692,16 @@ def propagate_chart_content(query_id: str, chart_index: int, patched_chart: dict
     try:
         with _conn() as conn:
             with conn.cursor() as cur:
-                # Drafts containing this chart
+                # Drafts: load any whose slots JSONB mentions this chart_id
                 cur.execute(
                     f"""
                     SELECT draft_id, slots
                     FROM {_SCHEMA}.reporting_canvas_drafts
-                    WHERE slots @> jsonb_build_array(
-                        jsonb_build_object('query_id', %s, 'chart_index', %s)
-                    )
+                    WHERE slots::text LIKE %s
                     """,
-                    (str(query_id), int(chart_index)),
+                    (f'%"chart_id": "{chart_id}"%',),
                 )
-                for did, slots in cur.fetchall():
+                for did, slots in list(cur.fetchall()):
                     if isinstance(slots, str):
                         try:
                             slots = json.loads(slots)
@@ -583,8 +709,8 @@ def propagate_chart_content(query_id: str, chart_index: int, patched_chart: dict
                             continue
                     changed = False
                     for s in (slots or []):
-                        if (str(s.get("query_id")) == str(query_id)
-                                and int(s.get("chart_index", -1)) == int(chart_index)):
+                        ch = s.get("chart") if isinstance(s, dict) else None
+                        if isinstance(ch, dict) and ch.get("chart_id") == chart_id:
                             s["chart"] = json.loads(chart_json)
                             changed = True
                     if changed:
@@ -598,18 +724,16 @@ def propagate_chart_content(query_id: str, chart_index: int, patched_chart: dict
                         )
                         counts["drafts"] += 1
 
-                # Templates containing this chart
+                # Templates: same pattern against selections
                 cur.execute(
                     f"""
                     SELECT template_id, selections
                     FROM {_SCHEMA}.reporting_templates
-                    WHERE selections @> jsonb_build_array(
-                        jsonb_build_object('query_id', %s, 'chart_index', %s)
-                    )
+                    WHERE selections::text LIKE %s
                     """,
-                    (str(query_id), int(chart_index)),
+                    (f'%"chart_id": "{chart_id}"%',),
                 )
-                for tid, sels in cur.fetchall():
+                for tid, sels in list(cur.fetchall()):
                     if isinstance(sels, str):
                         try:
                             sels = json.loads(sels)
@@ -617,8 +741,8 @@ def propagate_chart_content(query_id: str, chart_index: int, patched_chart: dict
                             continue
                     changed = False
                     for s in (sels or []):
-                        if (str(s.get("query_id")) == str(query_id)
-                                and int(s.get("chart_index", -1)) == int(chart_index)):
+                        ch = s.get("chart") if isinstance(s, dict) else None
+                        if isinstance(ch, dict) and ch.get("chart_id") == chart_id:
                             s["chart"] = json.loads(chart_json)
                             changed = True
                     if changed:
@@ -637,93 +761,48 @@ def propagate_chart_content(query_id: str, chart_index: int, patched_chart: dict
     return counts
 
 
-def propagate_draft_layout(draft_id: str, slots: list[dict]) -> int:
-    """Update the layout (x, y, w, h) on every template linked to this draft
-    so moves on the canvas flow through to the saved template without a
-    re-finalize.
+def sync_draft_to_template(draft_id: str, slots: list[dict]) -> int:
+    """Live-mirror the canvas draft into any template linked to it.
 
-    Matching rule: per template, for each selection whose
-    (query_id, chart_index) equals a slot's, copy x/y/w/h over.
-    `position` is re-derived from (y, x) so list-view order stays consistent.
+    The template's `selections` are overwritten with the draft's `slots`,
+    1:1. This handles every kind of canvas change in one go:
+      * chart added or removed   → selection added/removed
+      * chart moved or resized   → x/y/w/h carried over
+      * chart edited via NL       → updated chart object carried over
 
-    Unlinked selections are left untouched. Returns the number of templates
-    that were actually updated.
+    Returns the number of templates that were actually updated.
     """
     try:
-        # Build a lookup from (query_id, chart_index) → layout
-        layout_by_key: dict[tuple[str, int], dict[str, int]] = {}
-        for s in slots or []:
-            qid = s.get("query_id")
-            cidx = s.get("chart_index")
-            if qid is None or cidx is None:
-                continue
-            layout_by_key[(str(qid), int(cidx))] = {
-                "x": int(s.get("x", 0) or 0),
-                "y": int(s.get("y", 0) or 0),
-                "w": int(s.get("w", 6) or 6),
-                "h": int(s.get("h", 4) or 4),
-            }
-
-        if not layout_by_key:
-            return 0
-
-        updated = 0
         with _conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
-                    SELECT template_id, selections, last_rendered
+                    SELECT template_id
                     FROM {_SCHEMA}.reporting_templates
                     WHERE source_draft_id = %s
                     """,
                     (draft_id,),
                 )
-                rows = cur.fetchall()
-                for tid, sels, last_rendered in rows:
-                    if isinstance(sels, str):
-                        try:
-                            sels = json.loads(sels)
-                        except Exception:
-                            continue
-                    if not isinstance(sels, list):
-                        continue
+                template_ids = [r[0] for r in cur.fetchall()]
+                if not template_ids:
+                    return 0
 
-                    changed = False
-                    for sel in sels:
-                        key = (str(sel.get("query_id")), int(sel.get("chart_index")))
-                        layout = layout_by_key.get(key)
-                        if layout is None:
-                            continue
-                        for k in ("x", "y", "w", "h"):
-                            if sel.get(k) != layout[k]:
-                                sel[k] = layout[k]
-                                changed = True
-
-                    if not changed:
-                        continue
-
-                    # Re-derive position from 2D order (top-to-bottom, left-to-right)
-                    sels.sort(key=lambda s: (int(s.get("y", 0)), int(s.get("x", 0))))
-                    for i, s in enumerate(sels):
-                        s["position"] = i
-
-                    # Also propagate into last_rendered.charts if it exists, so
-                    # the Template View tab picks up the new layout without a
-                    # re-run. We only mutate x/y/w/h style keys on the chart
-                    # dict if they happen to be stored there; most of the
-                    # layout lives in `selections`.
+                payload = json.dumps(sanitize_for_json(slots or []), default=str)
+                updated = 0
+                for tid in template_ids:
                     cur.execute(
                         f"""
                         UPDATE {_SCHEMA}.reporting_templates
-                           SET selections = %s::jsonb
+                           SET selections = %s::jsonb,
+                               last_run_at = NOW()
                          WHERE template_id = %s
                         """,
-                        (json.dumps(sanitize_for_json(sels), default=str), tid),
+                        (payload, tid),
                     )
-                    updated += 1
-        return updated
+                    updated += cur.rowcount
+                return updated
     except Exception as exc:
-        logger.error("propagate_draft_layout failed: %s", exc)
+        logger.error("sync_draft_to_template failed: %s", exc)
         return 0
 
 
@@ -743,76 +822,143 @@ def delete_template(template_id: str) -> bool:
 
 
 # ─────────────────────────────────────────────
+# Chart reads (one row per chart in reporting_agent_charts)
+# ─────────────────────────────────────────────
+
+_CHART_COLS = (
+    "chart_id, query_id, user_id, thread_id, chart_index, chart_type, "
+    "title, description, insight, script, sql_index, chart_config, "
+    "created_at, updated_at"
+)
+
+
+def _hydrate_chart_row(row: dict) -> dict:
+    """Inline `chart_config` JSONB into the row's `chart` field so callers
+    get the same shape /report/stream emits."""
+    cfg = row.get("chart_config")
+    if isinstance(cfg, str):
+        try:
+            cfg = json.loads(cfg)
+        except Exception:
+            cfg = None
+    row["chart"] = cfg if isinstance(cfg, dict) else {}
+    return row
+
+
+def get_chart(chart_id: str) -> dict | None:
+    """Return one chart by id (with `chart_config` inlined as `chart`)."""
+    row = _fetch_row(
+        f"SELECT {_CHART_COLS} FROM {_SCHEMA}.reporting_agent_charts WHERE chart_id = %s",
+        (chart_id,),
+    )
+    return _hydrate_chart_row(row) if row else None
+
+
+def get_charts_for_query(query_id: str) -> list[dict]:
+    """Return every chart belonging to a query, ordered by chart_index."""
+    rows = _fetch_rows(
+        f"""
+        SELECT {_CHART_COLS}
+        FROM {_SCHEMA}.reporting_agent_charts
+        WHERE query_id = %s
+        ORDER BY chart_index ASC
+        """,
+        (query_id,),
+    )
+    return [_hydrate_chart_row(r) for r in rows]
+
+
+def get_charts_by_user(user_id: str, limit: int = 100) -> list[dict]:
+    """Return the most recent charts for a user, newest first."""
+    rows = _fetch_rows(
+        f"""
+        SELECT {_CHART_COLS}
+        FROM {_SCHEMA}.reporting_agent_charts
+        WHERE user_id = %s
+        ORDER BY created_at DESC
+        LIMIT %s
+        """,
+        (user_id, limit),
+    )
+    return [_hydrate_chart_row(r) for r in rows]
+
+
+def get_charts_by_thread(thread_id: str, limit: int = 100) -> list[dict]:
+    """Return the most recent charts in a chat thread, newest first."""
+    rows = _fetch_rows(
+        f"""
+        SELECT {_CHART_COLS}
+        FROM {_SCHEMA}.reporting_agent_charts
+        WHERE thread_id = %s
+        ORDER BY created_at DESC
+        LIMIT %s
+        """,
+        (thread_id, limit),
+    )
+    return [_hydrate_chart_row(r) for r in rows]
+
+
+# ─────────────────────────────────────────────
 # Chart edits (per-chart natural-language patches)
 # ─────────────────────────────────────────────
 
-def get_query_charts(query_id: str) -> list[dict] | None:
-    """Return the current `charts` JSON array for a query, or None if missing."""
-    row = _fetch_row(
-        f"SELECT charts FROM {_SCHEMA}.reporting_agent_queries WHERE query_id = %s",
-        (query_id,),
-    )
-    if not row:
-        return None
-    charts = row.get("charts")
-    if isinstance(charts, str):
-        try:
-            charts = json.loads(charts)
-        except Exception:
-            return None
-    return charts if isinstance(charts, list) else None
-
-
-def update_query_chart_at(query_id: str, chart_index: int, patched_chart: dict) -> bool:
+def update_chart_by_id(chart_id: str, patched_chart: dict) -> bool:
+    """Replace the saved chart's slim chart_config + extracted metadata.
+    Returns True if a row was updated.
     """
-    Overwrite one chart inside reporting_agent_queries.charts[chart_index].
-    Returns True on success, False otherwise.
-    """
+    meta = _extract_chart_meta(patched_chart, fallback_index=0)
+    storage_chart = _chart_for_storage(patched_chart)
     try:
         with _conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
-                    UPDATE {_SCHEMA}.reporting_agent_queries
-                       SET charts = jsonb_set(COALESCE(charts, '[]'::jsonb),
-                                              %s,
-                                              %s::jsonb,
-                                              false)
-                     WHERE query_id = %s
+                    UPDATE {_SCHEMA}.reporting_agent_charts SET
+                        chart_type   = %s,
+                        title        = %s,
+                        description  = %s,
+                        insight      = %s,
+                        script       = COALESCE(NULLIF(%s, ''), script),
+                        sql_index    = COALESCE(%s, sql_index),
+                        chart_config = %s::jsonb,
+                        updated_at   = NOW()
+                    WHERE chart_id = %s
                     """,
                     (
-                        "{" + str(int(chart_index)) + "}",
-                        json.dumps(patched_chart, default=str),
-                        query_id,
+                        meta["chart_type"], meta["title"],
+                        meta["description"], meta["insight"],
+                        meta["script"], meta["sql_index"],
+                        json.dumps(sanitize_for_json(storage_chart), default=str),
+                        chart_id,
                     ),
                 )
-        return True
+                return cur.rowcount > 0
     except Exception as exc:
-        logger.error("update_query_chart_at failed: %s", exc)
+        logger.error("update_chart_by_id failed: %s", exc)
         return False
 
 
-def log_chart_edit(query_id: str, chart_index: int, instruction: str, patched_chart: dict) -> None:
+def log_chart_edit(query_id: str, chart_id: str, instruction: str, patched_chart: dict) -> None:
     _exec(
         f"""
         INSERT INTO {_SCHEMA}.reporting_chart_edits
-            (query_id, chart_index, instruction, patched_chart, created_at)
+            (query_id, chart_id, instruction, patched_chart, created_at)
         VALUES (%s, %s, %s, %s, NOW())
         """,
-        (query_id, chart_index, instruction, json.dumps(patched_chart, default=str)),
+        (query_id, chart_id, instruction, json.dumps(patched_chart, default=str)),
     )
 
 
-def get_chart_edit_history(query_id: str, chart_index: int, limit: int = 20) -> list[dict]:
+def get_chart_edit_history(chart_id: str, limit: int = 20) -> list[dict]:
     return _fetch_rows(
         f"""
-        SELECT edit_id, query_id, chart_index, instruction, patched_chart, created_at
+        SELECT edit_id, query_id, chart_id, instruction, patched_chart, created_at
         FROM {_SCHEMA}.reporting_chart_edits
-        WHERE query_id = %s AND chart_index = %s
+        WHERE chart_id = %s
         ORDER BY created_at DESC
         LIMIT %s
         """,
-        (query_id, chart_index, limit),
+        (chart_id, limit),
     )
 
 
@@ -823,18 +969,16 @@ def get_chart_edit_history(query_id: str, chart_index: int, limit: int = 20) -> 
 def create_canvas_draft(
     draft_id: str,
     user_id: str,
-    username: str,
-    thread_id: str | None,
     name: str,
     project_type: str = "",
 ) -> None:
     _exec(
         f"""
         INSERT INTO {_SCHEMA}.reporting_canvas_drafts
-            (draft_id, user_id, username, thread_id, name, project_type, slots, created_at, updated_at)
-        VALUES (%s, %s, %s, %s, %s, %s, '[]'::jsonb, NOW(), NOW())
+            (draft_id, user_id, name, project_type, slots, created_at, updated_at)
+        VALUES (%s, %s, %s, %s, '[]'::jsonb, NOW(), NOW())
         """,
-        (draft_id, user_id, username, thread_id, name, project_type),
+        (draft_id, user_id, name, project_type),
     )
 
 
@@ -883,7 +1027,7 @@ def delete_canvas_draft(draft_id: str) -> bool:
 def get_canvas_draft(draft_id: str) -> dict | None:
     return _fetch_row(
         f"""
-        SELECT draft_id, user_id, username, thread_id, name, project_type,
+        SELECT draft_id, user_id, name, project_type,
                slots, created_at, updated_at
         FROM {_SCHEMA}.reporting_canvas_drafts
         WHERE draft_id = %s
@@ -892,26 +1036,11 @@ def get_canvas_draft(draft_id: str) -> dict | None:
     )
 
 
-def list_canvas_drafts(
-    user_id: str,
-    thread_id: str | None = None,
-    limit: int = 50,
-) -> list[dict]:
-    if thread_id:
-        return _fetch_rows(
-            f"""
-            SELECT draft_id, user_id, username, thread_id, name, project_type,
-                   slots, created_at, updated_at
-            FROM {_SCHEMA}.reporting_canvas_drafts
-            WHERE user_id = %s AND thread_id = %s
-            ORDER BY updated_at DESC
-            LIMIT %s
-            """,
-            (user_id, thread_id, limit),
-        )
+def list_canvas_drafts(user_id: str, limit: int = 50) -> list[dict]:
+    """All canvas drafts for a user (canvas is user-scoped, not thread-scoped)."""
     return _fetch_rows(
         f"""
-        SELECT draft_id, user_id, username, thread_id, name, project_type,
+        SELECT draft_id, user_id, name, project_type,
                slots, created_at, updated_at
         FROM {_SCHEMA}.reporting_canvas_drafts
         WHERE user_id = %s

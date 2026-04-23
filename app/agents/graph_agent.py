@@ -182,6 +182,71 @@ def _extract_evidence_records(tool_calls: list[dict]) -> list[dict[str, Any]]:
     return evidence
 
 
+DEFAULT_COLOR_PALETTE = [
+    "#2E86AB",  # primary blue
+    "#F18F01",  # orange
+    "#A23B72",  # magenta
+    "#3B8EA5",  # teal
+    "#C73E1D",  # red
+    "#6A994E",  # green
+]
+
+
+def _assign_chart_ids(charts: list[dict]) -> None:
+    """Stamp each chart with a UUID so callers can reference it without
+    relying on its position in the array.
+
+    `chart_id` is the stable handle used by /charts/edit, canvas slots,
+    template selections, and DB-side chart-edit propagation. Charts
+    already carrying a `chart_id` (e.g. coming back from chart-edit)
+    keep their existing value.
+    """
+    import uuid
+    for c in charts:
+        if not isinstance(c, dict):
+            continue
+        if not c.get("chart_id"):
+            c["chart_id"] = str(uuid.uuid4())
+
+
+def _ensure_default_colors(charts: list[dict]) -> None:
+    """Defensive backstop for prompt rule #15.
+
+    Newly-generated charts must use the fixed palette so saved reports stay
+    visually consistent. The chart-edit API is the only path that should
+    change colors. If a chart already has a `colors` array (e.g. a prior
+    edit applied a custom one), leave it alone.
+    """
+    for c in charts:
+        if not isinstance(c, dict):
+            continue
+        existing = c.get("colors")
+        if isinstance(existing, list) and existing:
+            continue
+        c["colors"] = list(DEFAULT_COLOR_PALETTE)
+
+
+def _round_floats(node: Any, ndigits: int = 2) -> Any:
+    """Recursively round every float in a chart config to `ndigits` decimals.
+
+    Defensive backstop for the prompt's "max 2 decimals" rule — the LLM
+    sometimes emits 0.3333333333. Integers, bools, and non-numeric values
+    pass through untouched.
+    """
+    if isinstance(node, float):
+        # bool is a subclass of int (not float), so no special-case needed
+        return round(node, ndigits)
+    if isinstance(node, dict):
+        for k, v in node.items():
+            node[k] = _round_floats(v, ndigits)
+        return node
+    if isinstance(node, list):
+        for i, v in enumerate(node):
+            node[i] = _round_floats(v, ndigits)
+        return node
+    return node
+
+
 def _attach_evidence_to_charts(charts: list[dict], evidence: list[dict]) -> None:
     """Mutate each chart dict to include its linked evidence payload."""
     ev_by_index = {e["index"]: e for e in evidence}
@@ -295,6 +360,16 @@ def generate_charts(
 
             if "rationale" not in parsed:
                 parsed["rationale"] = "Charts generated based on the available data."
+
+            # Defensive backstops for the prompt rules + identity:
+            #   #14   — every float in the chart config rounded to 2 decimals
+            #   #15   — every chart carries the fixed `colors` palette
+            #   id    — every chart gets a stable UUID `chart_id`
+            # All three run BEFORE evidence attachment so the raw evidence rows
+            # keep full precision for debugging.
+            _round_floats(parsed.get("charts", []))
+            _ensure_default_colors(parsed.get("charts", []))
+            _assign_chart_ids(parsed.get("charts", []))
 
             # Attach per-chart evidence: the Python/SQL code + resulting rows that
             # produced the chart. The UI (and report templates) need this so every

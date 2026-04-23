@@ -1,7 +1,7 @@
 """
 SSE streaming endpoint for report generation.
 
-GET /api/v1/report/stream?query=...&project_type=...&user_id=...&username=...
+GET /api/v1/report/stream?query=...&project_type=...&user_id=...
 
 Returns a Server-Sent Events stream with real-time progress updates:
   event: step       → {step, total, label}
@@ -44,7 +44,6 @@ def _run_stream_thread(
     project_type: str,
     query_id: str,
     user_id: str,
-    username: str,
     max_charts: int,
     thread_id: str | None = None,
 ) -> None:
@@ -56,7 +55,7 @@ def _run_stream_thread(
     print(f"{'=' * 70}{_RESET}", flush=True)
     print(f"  {_DIM}Query ID    : {query_id}{_RESET}", flush=True)
     print(f"  {_DIM}Thread ID   : {thread_id or '-'}{_RESET}", flush=True)
-    print(f"  {_DIM}User        : {username} ({user_id}){_RESET}", flush=True)
+    print(f"  {_DIM}User        : {user_id}{_RESET}", flush=True)
     print(f"  {_DIM}Query       : {query}{_RESET}", flush=True)
     print(f"  {_DIM}Project type: {project_type}{_RESET}", flush=True)
 
@@ -65,7 +64,6 @@ def _run_stream_thread(
         db_service.ensure_thread(
             thread_id=thread_id,
             user_id=user_id,
-            username=username,
             project_type=project_type,
             title=query[:120],
         )
@@ -74,7 +72,6 @@ def _run_stream_thread(
     db_service.create_query(
         query_id=query_id,
         user_id=user_id,
-        username=username,
         original_query=query,
         project_type=project_type,
         max_charts=max_charts,
@@ -91,6 +88,7 @@ def _run_stream_thread(
             query_id=query_id,
             emit=emit,
             max_charts=max_charts,
+            thread_id=thread_id,
         )
 
         elapsed_ms = (time.perf_counter() - start_time) * 1000
@@ -160,7 +158,6 @@ async def stream_report_endpoint(
     query: str = Query(..., description="Natural language query"),
     project_type: str = Query(..., description="NTM, AHLOB Modernization, or Both"),
     user_id: str = Query(..., description="User identifier"),
-    username: str = Query(..., description="Display name"),
     max_charts: int = Query(default=3, ge=1, le=5, description="Maximum charts"),
     thread_id: str | None = Query(default=None, description="Chat thread ID"),
 ):
@@ -181,7 +178,7 @@ async def stream_report_endpoint(
     loop.run_in_executor(
         None,
         _run_stream_thread,
-        query, project_type, query_id, user_id, username, max_charts, thread_id,
+        query, project_type, query_id, user_id, max_charts, thread_id,
     )
 
     # Send preamble + stream events

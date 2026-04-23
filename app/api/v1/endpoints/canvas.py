@@ -22,7 +22,7 @@ import uuid
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from services import db_service
 
@@ -34,39 +34,95 @@ MAX_SLOTS_PER_DRAFT = 6
 
 # ── Models ──────────────────────────────────────────────────────────────────
 
-class CanvasSlot(BaseModel):
-    """One chart slot inside a draft.
+# A single example used in BOTH the Swagger preview and the runtime example.
+# Edit it once here and Swagger picks the change up everywhere.
+_EXAMPLE_CHART: dict[str, Any] = {
+    "chart_id": "0c7e9b4a-c3d6-4d2c-9c8a-7b1d5d8f9e10",
+    "chart":    {"type": "column"},
+    "colors":   ["#2E86AB", "#F18F01", "#A23B72", "#3B8EA5", "#C73E1D", "#6A994E"],
+    "title":    {"text": "Weekly GC Run Rate by Region"},
+    "subtitle": {"text": "NTM Projects, Last 12 Weeks"},
+    "xAxis":    {"categories": ["CENTRAL", "NORTHEAST", "SOUTH"], "title": {"text": "Region"}},
+    "yAxis":    {"title": {"text": "Sites / week"}},
+    "series":   [{"name": "Run rate", "data": [0.25, 0.08, 0.08]}],
+    "legend":   {"enabled": True},
+    "tooltip":  {"valueSuffix": " sites/week"},
+    "plotOptions": {"column": {"dataLabels": {"enabled": True}}},
+    "description": "Central region leads at 0.25 sites/week.",
+    "insight":  ("Central leads with 0.25 sites/week, 3x the 0.08 rate of "
+                 "Northeast and South. Run rate has held steady for the trailing "
+                 "12-week window."),
+    "script":   "sql = '''SELECT rgn_region, COUNT(*) FROM ...'''\nresult = run_sql(sql)",
+    "sql_index": 1,
+}
 
-    Positioning (2D canvas):
-      * `x`, `y`, `w`, `h` describe the chart's position on a 12-column grid.
-        - `x`  column offset  (0..11)
-        - `y`  row offset     (0..N)
-        - `w`  width  in cols (1..12)
-        - `h`  height in rows (1..N)
-      * `position` is kept for legacy list ordering (0-indexed). The server
-        re-derives it from y ascending → x ascending on every write so the
-        two views stay consistent.
+_EXAMPLE_SLOT: dict[str, Any] = {
+    "query_id":       "23237b8e-a963-459e-920a-3ffbafa1f015",
+    "chart":          _EXAMPLE_CHART,   # chart.script is the script — no duplicate at slot level
+    "original_query": "give the GC run rate region wise",
+    "x": 0, "y": 0, "w": 6, "h": 4,
+}
+
+
+class ChartFromReport(BaseModel):
+    """A chart object as produced by `GET /api/v1/report/stream` (the
+    `complete.charts[i]` payload).
+
+    Pasted as-is into a `CanvasSlot.chart` — no remapping required. Fields
+    are loosely typed (Highcharts options are deeply nested) but every key
+    that comes out of /report/stream is documented here, so Swagger shows
+    real names instead of `additionalProp1`.
     """
-    position:       int | None = Field(default=None, ge=0)
-    x:              int | None = Field(default=None, ge=0, le=11)
-    y:              int | None = Field(default=None, ge=0)
-    w:              int | None = Field(default=None, ge=1, le=12)
-    h:              int | None = Field(default=None, ge=1)
-    query_id:       str
-    chart_index:    int = Field(..., ge=0)
-    original_query: str = ""
-    chart:          dict[str, Any]
-    evidence:       dict[str, Any] | None = None
-    # Accept any extra fields the client may add (e.g. `source`) without
-    # rejecting — they get persisted as-is inside the JSONB.
-    class Config:
-        extra = "allow"
+    chart_id:    str = Field(..., description="Stable UUID assigned by the graph agent; the only handle the chart-edit and propagation APIs use.")
+    chart:       dict[str, Any] | None = Field(default=None, description="Highcharts type config, e.g. {\"type\":\"column\"}")
+    colors:      list[str]      | None = Field(default=None, description="Series colors (default palette injected at creation)")
+    title:       dict[str, Any] | None = Field(default=None, description="{\"text\": \"…\"}")
+    subtitle:    dict[str, Any] | None = Field(default=None, description="{\"text\": \"scope context\"}")
+    xAxis:       dict[str, Any] | list[Any] | None = Field(default=None, description="Categories + axis title")
+    yAxis:       dict[str, Any] | list[Any] | None = Field(default=None, description="Axis title")
+    series:      list[Any]      | None = Field(default=None, description="Highcharts series array")
+    legend:      dict[str, Any] | None = Field(default=None)
+    tooltip:     dict[str, Any] | None = Field(default=None)
+    plotOptions: dict[str, Any] | None = Field(default=None)
+    description: str | None = Field(default=None, description="One-line takeaway")
+    insight:     str | None = Field(default=None, description="2-3 line plain-string insight")
+    script:      str | None = Field(default=None, description="Python+SQL code that produced the chart")
+    sql_index:   int | None = Field(default=None, description="1-indexed pointer back to the SQL block")
+
+    model_config = ConfigDict(extra="allow", json_schema_extra={"example": _EXAMPLE_CHART})
+
+
+class CanvasSlot(BaseModel):
+    """One chart slot inside a canvas draft.
+
+    Copy each chart from the `/report/stream` complete event into a slot:
+
+      * `query_id` ← `stream_started.query_id`
+      * `chart`    ← `complete.charts[i]`   (the whole object — paste it as-is.
+                                              `chart.script` is what powers re-run.)
+
+    Layout (`x`, `y`, `w`, `h`, `position`) is optional — the server auto-places
+    new tiles in the first free spot on the 12-column grid.
+    """
+    query_id: str = Field(..., description="From SSE stream_started.query_id")
+    chart:    ChartFromReport = Field(..., description="Full chart object from /report/stream complete.charts[i] — includes chart_id, script, insight, colors, etc.")
+
+    original_query: str = Field(default="", description="The NL question that produced the chart")
+
+    x:        int | None = Field(default=None, ge=0, le=11, description="Column offset 0..11 on the 12-col grid")
+    y:        int | None = Field(default=None, ge=0,        description="Row offset (≥0)")
+    w:        int | None = Field(default=None, ge=1, le=12, description="Width in cols 1..12")
+    h:        int | None = Field(default=None, ge=1,        description="Height in rows ≥1")
+    position: int | None = Field(default=None, ge=0,        description="Legacy list order; server re-derives from (y, x)")
+
+    model_config = ConfigDict(
+        extra="ignore",                      # → no `additionalProp1` in Swagger
+        json_schema_extra={"example": _EXAMPLE_SLOT},
+    )
 
 
 class CanvasDraftCreate(BaseModel):
     user_id:      str
-    username:     str
-    thread_id:    str | None = None
     name:         str
     project_type: str = ""
 
@@ -163,12 +219,12 @@ def _normalise_positions(slots: list[dict]) -> list[dict]:
 
 @router.get("/canvas/drafts", summary="List canvas drafts for a user")
 def list_drafts(
-    user_id: str = Query(...),
-    thread_id: str | None = Query(default=None),
-    limit: int = Query(default=50, le=200),
+    user_id: str = Query(..., description="Owner of the drafts"),
+    limit:   int = Query(default=50, le=200),
 ):
-    rows = db_service.list_canvas_drafts(user_id, thread_id=thread_id, limit=limit)
-    return {"drafts": rows}
+    """Canvas drafts are USER-scoped — a single canvas can mix charts the
+    user collected from any number of chat threads. There is no thread filter."""
+    return {"drafts": db_service.list_canvas_drafts(user_id, limit=limit)}
 
 
 @router.post("/canvas/drafts", summary="Create a new empty canvas draft")
@@ -177,8 +233,6 @@ def create_draft(payload: CanvasDraftCreate):
     db_service.create_canvas_draft(
         draft_id=draft_id,
         user_id=payload.user_id,
-        username=payload.username,
-        thread_id=payload.thread_id,
         name=payload.name.strip() or "Untitled report",
         project_type=payload.project_type,
     )
@@ -218,17 +272,16 @@ def patch_draft(draft_id: str, payload: CanvasDraftPatch):
         slots=slots_payload,
     )
 
-    # Live layout sync: any template finalized from this draft inherits the
-    # new x/y/w/h for matching charts, so moves on the canvas flow into the
-    # saved report without having to re-finalize.
+    # Live mirror: any template finalized from this draft is kept in sync
+    # with the canvas — slot adds, removes, moves, and chart edits all flow
+    # into the linked template's selections without a manual re-finalize.
     if slots_payload is not None:
         try:
-            n = db_service.propagate_draft_layout(draft_id, slots_payload)
+            n = db_service.sync_draft_to_template(draft_id, slots_payload)
             if n:
-                logger.info("propagated layout to %d template(s) linked to draft %s",
-                            n, draft_id)
+                logger.info("synced canvas → %d template(s) linked to draft %s", n, draft_id)
         except Exception as e:
-            logger.warning("layout propagation failed for draft %s: %s", draft_id, e)
+            logger.warning("template sync failed for draft %s: %s", draft_id, e)
 
     return db_service.get_canvas_draft(draft_id)
 

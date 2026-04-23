@@ -30,12 +30,34 @@ Choose chart types based on what the data reveals:
 5. **Compare when possible**: Completed vs Pending, This Quarter vs Last, Actual vs Target
 6. **Limit categories**: Show top 10-15 categories max; group the rest as "Others"
 
+# DEFAULT COLOR PALETTE — USE THESE EXACT COLORS, IN ORDER
+Every chart MUST set `colors` on the top-level config to this fixed palette
+(do NOT invent new hex codes, do NOT randomise them). The same palette is
+used for EVERY chart so a saved report stays visually consistent. The chart
+edit API is the only thing that should ever change colors after generation.
+
+```
+"colors": ["#2E86AB", "#F18F01", "#A23B72", "#3B8EA5", "#C73E1D", "#6A994E"]
+```
+
+Use them positionally:
+  * series[0] / first pie slice → `#2E86AB`  (primary blue)
+  * series[1] / second slice    → `#F18F01`  (orange)
+  * series[2] / third slice     → `#A23B72`  (magenta)
+  * series[3] / fourth slice    → `#3B8EA5`  (teal)
+  * series[4] / fifth slice     → `#C73E1D`  (red)
+  * series[5] / sixth slice     → `#6A994E`  (green)
+
+For pie charts also set `colors` at the top level — Highcharts will assign
+them to slices in the order the data array is given.
+
 # HIGHCHARTS CONFIG STRUCTURE
 Each chart must follow this Highcharts options object structure:
 
 For standard charts (column, bar, line, area, scatter, spline, areaspline):
 {{{{
     "chart": {{{{ "type": "column" }}}},
+    "colors": ["#2E86AB", "#F18F01", "#A23B72", "#3B8EA5", "#C73E1D", "#6A994E"],
     "title": {{{{ "text": "Descriptive Chart Title" }}}},
     "subtitle": {{{{ "text": "Scope context (market, project type, date range)" }}}},
     "xAxis": {{{{
@@ -61,6 +83,7 @@ For standard charts (column, bar, line, area, scatter, spline, areaspline):
 For pie charts:
 {{{{
     "chart": {{{{ "type": "pie" }}}},
+    "colors": ["#2E86AB", "#F18F01", "#A23B72", "#3B8EA5", "#C73E1D", "#6A994E"],
     "title": {{{{ "text": "Distribution Title" }}}},
     "subtitle": {{{{ "text": "Scope context" }}}},
     "series": [{{{{
@@ -85,25 +108,13 @@ Your response MUST be a single JSON object with exactly this structure:
         {{{{
             ... highcharts config object ...
             "description": "One-sentence takeaway — the single most important finding.",
-            "insight": {{{{
-                "headline": "<one-line headline with the #1 finding AND a real number, e.g., 'Houston leads with 324 pending sites — 2.1× the 53-market median'>",
-                "what_the_data_shows": [
-                    "<bullet with a concrete number pulled from the data>",
-                    "<bullet with a ranking or distribution>",
-                    "<bullet calling out an outlier or anomaly explicitly>"
-                ],
-                "why_it_matters": [
-                    "<bullet interpreting the pattern in business terms>",
-                    "<bullet comparing to another benchmark when available>"
-                ],
-                "recommended_next_step": "<one actionable sentence — what a PM/analyst would do next>"
-            }}}},
+            "insight": "<2-3 short lines (max 3 sentences) summarizing the chart. Lead with the #1 finding and a concrete number. Mention one comparison or outlier. No bullet markers, no markdown, plain sentences separated by spaces or single newlines.>",
             "evidence_sql_index": 1
         }}}},
         {{{{
             ... highcharts config object ...
             "description": "...",
-            "insight": {{{{ ...same structured object as above... }}}},
+            "insight": "<same 2-3 line string as above>",
             "evidence_sql_index": 2
         }}}}
     ],
@@ -115,18 +126,14 @@ points to the `SQL Result N` block (1-indexed) whose data you used to build the 
 If a chart blends two SQL results, pick the primary one. This is how the UI links each
 chart back to the code + rows that produced it.
 
-**insight** (STRUCTURED OBJECT — this is what stakeholders see; the UI renders each
-field as its own section):
-  * `headline` — ONE string, max one line. Must contain a concrete number.
-  * `what_the_data_shows` — array of 2-4 short strings. Each string is one bullet,
-    must include a concrete number pulled from the data (percent, count, rate,
-    delta, ratio). No leading "- ", no markdown inside — plain sentences.
-  * `why_it_matters` — array of 1-3 short strings. Interpret the pattern in business
-    terms and include at least ONE comparison (vs median, vs best, vs target, vs peer).
-  * `recommended_next_step` — ONE short sentence. What a PM/analyst does next.
-  * Never fabricate numbers. If a number is not in the SQL result, do not use it.
-  * The same `insight` object travels into the report canvas and saved templates,
-    so each bullet must stand on its own without the SQL alongside.
+**insight** (PLAIN STRING — 2-3 short lines, max 3 sentences total):
+  * Lead with the single most important finding AND a concrete number.
+  * Add ONE comparison, ranking, or outlier callout (vs median/best/peer/target).
+  * Optional third sentence: a brief "so what" if it adds value — otherwise stop at 2.
+  * No markdown, no bullet markers, no headings. Plain sentences only.
+  * Numbers must come from the SQL result — never invent values.
+  * This is what travels into the canvas and saved templates, so it must read
+    as a stand-alone summary without the SQL alongside.
 
 # STRICT RULES
 1. Output ONLY valid JSON. No markdown. No ```json blocks. No text before or after.
@@ -141,9 +148,18 @@ field as its own section):
 10. Use subtitle for scope context (market, project type, date range).
 11. Sort categories by value descending unless the data is chronological.
 12. Every number in `insight` must appear in (or be derivable from) the SQL result — never invent numbers.
-13. `insight` MUST be a JSON object with the exact keys shown above
-    (`headline`, `what_the_data_shows`, `why_it_matters`, `recommended_next_step`)
-    — never a plain string, never markdown.
+13. `insight` MUST be a plain string — 2-3 sentences, max 3 lines, no markdown,
+    no bullet markers, no JSON object. Lead with the #1 finding + a real number.
+14. NUMERIC PRECISION — every number that appears in a chart (series data, axis
+    values, dataLabels, tooltips) and every number quoted inside `insight` /
+    `description` / `rationale` MUST be rounded to AT MOST 2 decimal places.
+    Examples: write `2.23` not `2.3333333333`; write `87.5` not `87.5000`;
+    integers stay integers (write `42` not `42.00`). Percentages also follow
+    this rule — write `12.34%` not `12.3456%`.
+15. COLORS — every chart MUST set the top-level `colors` array to the exact
+    palette shown above (`["#2E86AB", "#F18F01", "#A23B72", "#3B8EA5",
+    "#C73E1D", "#6A994E"]`). Do NOT use other hex codes. Do NOT randomise.
+    Color overrides are made later via the chart-edit API, not at generation.
 """
 
 GRAPH_AGENT_USER = """# User Question

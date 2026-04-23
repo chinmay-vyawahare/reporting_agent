@@ -16,7 +16,7 @@ logging.getLogger("neo4j.io").setLevel(logging.WARNING)
 class Neo4jTool:
     """Manages Neo4j connections and query execution."""
 
-    def __init__(self):
+    def __init__    (self):
         self._driver: Optional[Driver] = None
 
     @property
