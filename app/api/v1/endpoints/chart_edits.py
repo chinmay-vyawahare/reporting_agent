@@ -58,10 +58,29 @@ def edit_chart(payload: ChartEditIn):
         payload.query_id, payload.chart_index, payload.instruction, patched
     )
 
+    # Propagate the new chart content into every canvas draft and every
+    # finalized template that carries this chart, so edits made anywhere
+    # (chat, canvas quick-edit, per-slot edit) flow through to all views
+    # without a manual re-finalize.
+    try:
+        propagation = db_service.propagate_chart_content(
+            payload.query_id, payload.chart_index, patched,
+        )
+        if propagation.get("drafts") or propagation.get("templates"):
+            logger.info(
+                "chart-edit propagated: drafts=%d templates=%d (query=%s, idx=%d)",
+                propagation["drafts"], propagation["templates"],
+                payload.query_id, payload.chart_index,
+            )
+    except Exception as e:
+        logger.warning("chart-edit propagation failed (non-fatal): %s", e)
+        propagation = {"drafts": 0, "templates": 0}
+
     return {
         "query_id": payload.query_id,
         "chart_index": payload.chart_index,
         "chart": patched,
+        "propagation": propagation,
     }
 
 

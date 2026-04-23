@@ -438,6 +438,73 @@ def create_template(
     )
 
 
+def update_template(
+    template_id: str,
+    title: str | None = None,
+    project_type: str | None = None,
+    selections: list[dict] | None = None,
+    last_rendered: dict | None = None,
+    source_draft_id: str | None = None,
+) -> bool:
+    """Partial update — pass only the fields you want to change.
+
+    Returns True if a row was updated (i.e. the template exists), False otherwise.
+    `last_run_at` is bumped if `selections` or `last_rendered` was supplied so
+    the audit trail tracks meaningful changes.
+    """
+    sets: list[str] = []
+    params: list = []
+    if title is not None:
+        sets.append("title = %s")
+        params.append(title)
+    if project_type is not None:
+        sets.append("project_type = %s")
+        params.append(project_type)
+    if selections is not None:
+        sets.append("selections = %s::jsonb")
+        params.append(json.dumps(sanitize_for_json(selections), default=str))
+    if last_rendered is not None:
+        sets.append("last_rendered = %s::jsonb")
+        params.append(json.dumps(sanitize_for_json(last_rendered), default=str))
+    if source_draft_id is not None:
+        sets.append("source_draft_id = %s")
+        params.append(source_draft_id)
+    if selections is not None or last_rendered is not None:
+        sets.append("last_run_at = NOW()")
+    if not sets:
+        return True  # nothing to update; treat as a no-op success
+    params.append(template_id)
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE {_SCHEMA}.reporting_templates "
+                    f"SET {', '.join(sets)} WHERE template_id = %s",
+                    tuple(params),
+                )
+                return cur.rowcount > 0
+    except Exception as exc:
+        logger.error("update_template failed: %s", exc)
+        return False
+
+
+def find_template_by_draft(source_draft_id: str) -> dict | None:
+    """Return the most recently created template linked to a canvas draft,
+    or None if none exists. Used for upsert-by-draft semantics."""
+    return _fetch_row(
+        f"""
+        SELECT template_id, user_id, username, thread_id, source_draft_id,
+               title, project_type, selections, last_rendered,
+               created_at, last_run_at
+        FROM {_SCHEMA}.reporting_templates
+        WHERE source_draft_id = %s
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (source_draft_id,),
+    )
+
+
 def update_template_render(template_id: str, last_rendered: dict) -> None:
     _exec(
         f"""
@@ -473,6 +540,101 @@ def get_templates_by_user(user_id: str, limit: int = 50) -> list[dict]:
         """,
         (user_id, limit),
     )
+
+
+def propagate_chart_content(query_id: str, chart_index: int, patched_chart: dict) -> dict[str, int]:
+    """When a chart is edited (via POST /charts/edit), write the new chart
+    content into every canvas draft and every template that contains this
+    (query_id, chart_index). Keeps positional fields (x/y/w/h/position) on
+    each slot/selection intact — only the `chart` payload is replaced.
+
+    Returns {"drafts": n_drafts, "templates": n_templates}.
+    """
+    counts = {"drafts": 0, "templates": 0}
+
+    if patched_chart is None:
+        return counts
+
+    try:
+        chart_json = json.dumps(sanitize_for_json(patched_chart), default=str)
+    except Exception as exc:
+        logger.error("propagate_chart_content: chart JSON dump failed: %s", exc)
+        return counts
+
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                # Drafts containing this chart
+                cur.execute(
+                    f"""
+                    SELECT draft_id, slots
+                    FROM {_SCHEMA}.reporting_canvas_drafts
+                    WHERE slots @> jsonb_build_array(
+                        jsonb_build_object('query_id', %s, 'chart_index', %s)
+                    )
+                    """,
+                    (str(query_id), int(chart_index)),
+                )
+                for did, slots in cur.fetchall():
+                    if isinstance(slots, str):
+                        try:
+                            slots = json.loads(slots)
+                        except Exception:
+                            continue
+                    changed = False
+                    for s in (slots or []):
+                        if (str(s.get("query_id")) == str(query_id)
+                                and int(s.get("chart_index", -1)) == int(chart_index)):
+                            s["chart"] = json.loads(chart_json)
+                            changed = True
+                    if changed:
+                        cur.execute(
+                            f"""
+                            UPDATE {_SCHEMA}.reporting_canvas_drafts
+                               SET slots = %s::jsonb, updated_at = NOW()
+                             WHERE draft_id = %s
+                            """,
+                            (json.dumps(sanitize_for_json(slots), default=str), did),
+                        )
+                        counts["drafts"] += 1
+
+                # Templates containing this chart
+                cur.execute(
+                    f"""
+                    SELECT template_id, selections
+                    FROM {_SCHEMA}.reporting_templates
+                    WHERE selections @> jsonb_build_array(
+                        jsonb_build_object('query_id', %s, 'chart_index', %s)
+                    )
+                    """,
+                    (str(query_id), int(chart_index)),
+                )
+                for tid, sels in cur.fetchall():
+                    if isinstance(sels, str):
+                        try:
+                            sels = json.loads(sels)
+                        except Exception:
+                            continue
+                    changed = False
+                    for s in (sels or []):
+                        if (str(s.get("query_id")) == str(query_id)
+                                and int(s.get("chart_index", -1)) == int(chart_index)):
+                            s["chart"] = json.loads(chart_json)
+                            changed = True
+                    if changed:
+                        cur.execute(
+                            f"""
+                            UPDATE {_SCHEMA}.reporting_templates
+                               SET selections = %s::jsonb
+                             WHERE template_id = %s
+                            """,
+                            (json.dumps(sanitize_for_json(sels), default=str), tid),
+                        )
+                        counts["templates"] += 1
+    except Exception as exc:
+        logger.error("propagate_chart_content failed: %s", exc)
+
+    return counts
 
 
 def propagate_draft_layout(draft_id: str, slots: list[dict]) -> int:

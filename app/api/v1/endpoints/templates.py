@@ -89,7 +89,48 @@ def list_thread_queries(thread_id: str, limit: int = Query(default=100, le=500))
 MAX_CHARTS_PER_TEMPLATE = 6
 
 
-@router.post("/templates", summary="Create a finalized report template from selected charts")
+class TemplatePatch(BaseModel):
+    """Partial update for an existing template. Send only the fields you
+    want to change; everything else stays as it was."""
+    title:           str | None = None
+    project_type:    str | None = None
+    source_draft_id: str | None = None
+    selections:      list[TemplateSelectionIn] | None = None
+
+
+@router.patch("/templates/{template_id}", summary="Partially update a template (rename, replace selections, etc.)")
+def patch_template(template_id: str, payload: TemplatePatch):
+    existing = db_service.get_template(template_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Template not found")
+
+    sels_payload = None
+    last_rendered_payload = None
+    if payload.selections is not None:
+        if len(payload.selections) > MAX_CHARTS_PER_TEMPLATE:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Max {MAX_CHARTS_PER_TEMPLATE} charts, got {len(payload.selections)}.",
+            )
+        from api.v1.endpoints.canvas import _normalise_positions as _norm_layout
+        raw = [s.dict() for s in payload.selections]
+        sels_payload = _norm_layout(raw)
+        last_rendered_payload = {"charts": [s["chart"] for s in sels_payload]}
+
+    ok = db_service.update_template(
+        template_id=template_id,
+        title=payload.title.strip() if payload.title is not None else None,
+        project_type=payload.project_type if payload.project_type is not None else None,
+        selections=sels_payload,
+        last_rendered=last_rendered_payload,
+        source_draft_id=payload.source_draft_id if payload.source_draft_id is not None else None,
+    )
+    if not ok:
+        raise HTTPException(status_code=500, detail="Update failed")
+    return db_service.get_template(template_id)
+
+
+@router.post("/templates", summary="Create a template, OR update one that already exists for the same source_draft_id (upsert)")
 def create_template(payload: TemplateIn):
     if not payload.selections:
         raise HTTPException(status_code=400, detail="At least one chart selection is required.")
@@ -99,14 +140,32 @@ def create_template(payload: TemplateIn):
             detail=f"Max {MAX_CHARTS_PER_TEMPLATE} charts per template, got {len(payload.selections)}.",
         )
 
-    template_id = str(uuid.uuid4())
     raw_selections = [s.dict() for s in payload.selections]
     # Reuse the canvas layout normaliser so templates respect the exact 2D
     # positioning from the draft. This assigns x/y/w/h for any slots that
     # arrive without them and re-derives `position` from the 2D order.
     from api.v1.endpoints.canvas import _normalise_positions as _norm_layout
     raw_selections = _norm_layout(raw_selections)
+    last_rendered = {"charts": [s["chart"] for s in raw_selections]}
 
+    # Upsert: if the source draft already has a template, update it in place
+    # so finalizing the same canvas twice doesn't sprout duplicate templates.
+    existing = (db_service.find_template_by_draft(payload.source_draft_id)
+                if payload.source_draft_id else None)
+
+    if existing:
+        template_id = existing["template_id"]
+        db_service.update_template(
+            template_id=template_id,
+            title=payload.title,
+            project_type=payload.project_type,
+            selections=raw_selections,
+            last_rendered=last_rendered,
+            source_draft_id=payload.source_draft_id,
+        )
+        return {"template_id": template_id, "action": "updated"}
+
+    template_id = str(uuid.uuid4())
     db_service.create_template(
         template_id=template_id,
         user_id=payload.user_id,
@@ -115,11 +174,10 @@ def create_template(payload: TemplateIn):
         title=payload.title,
         project_type=payload.project_type,
         selections=raw_selections,
-        last_rendered={"charts": [s["chart"] for s in raw_selections]},
+        last_rendered=last_rendered,
         source_draft_id=payload.source_draft_id,
     )
-
-    return {"template_id": template_id}
+    return {"template_id": template_id, "action": "created"}
 
 
 @router.get("/templates", summary="List templates for a user")

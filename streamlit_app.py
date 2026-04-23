@@ -118,14 +118,10 @@ def render_readonly_grid(slots: list[dict], container_key: str,
         h = int(s.get("h", 4) or 4)
         chart_json = json.dumps(s.get("chart") or {}, default=str)
         host_id = f"ro-chart-{container_key}-{x}-{y}-{w}-{h}"
-        title = ""
-        if isinstance((s.get("chart") or {}).get("title"), dict):
-            title = (s["chart"]["title"].get("text") or "")
-        title_safe = (title or "Chart")[:80].replace('"', '&quot;')
+        # Only the chart goes inside the tile — no title bar, no scripts visible.
         tiles.append(f"""
           <div class="grid-stack-item" gs-x="{x}" gs-y="{y}" gs-w="{w}" gs-h="{h}" gs-no-resize gs-no-move>
             <div class="grid-stack-item-content tile">
-              <div class="tile-head"><span class="tile-title" title="{title_safe}">{title_safe}</span></div>
               <div class="chart-host" id="{host_id}"></div>
               <script type="application/json" class="chart-config" data-host="{host_id}">{chart_json}</script>
             </div>
@@ -145,14 +141,9 @@ def render_readonly_grid(slots: list[dict], container_key: str,
         .grid-stack {{ background: rgba(0,0,0,0.015); border-radius: 6px; }}
         .grid-stack-item-content.tile {{
           background: #fff; border: 1px solid #e5e7eb; border-radius: 8px;
-          overflow: hidden; display: flex; flex-direction: column;
+          overflow: hidden;
         }}
-        .tile-head {{
-          padding: 6px 10px; border-bottom: 1px solid #f3f4f6;
-          font-weight: 600; font-size: 13px; background: #fafafa;
-          white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-        }}
-        .chart-host {{ flex: 1; padding: 4px; min-height: 0; }}
+        .chart-host {{ width: 100%; height: 100%; padding: 4px; box-sizing: border-box; }}
       </style>
     </head>
     <body>
@@ -199,9 +190,10 @@ def render_gridstack_canvas(slots: list[dict], draft_id: str, api_base: str,
     to have Streamlit re-fetch from the DB (updates other views — e.g., the
     finalize payload).
     """
-    # Build one gridstack-item per slot. The chart config is embedded as a
-    # JSON string and rendered with the same Highcharts script we use
-    # elsewhere — so tiles look identical to the chat chart cards.
+    # Build one gridstack-item per slot. Only the chart goes into the tile —
+    # no title bar, no data, no insight, no script. Highcharts already paints
+    # its own chart.title inside the chart, so a redundant header would just
+    # eat vertical space.
     items_html = []
     for s in slots:
         x = int(s.get("x", 0) or 0)
@@ -210,21 +202,12 @@ def render_gridstack_canvas(slots: list[dict], draft_id: str, api_base: str,
         h = int(s.get("h", 4) or 4)
         source = s.get("source") or f"{s.get('query_id', '')}:{s.get('chart_index', '')}"
         chart_json = json.dumps(s.get("chart") or {}, default=str)
-        title = ""
-        if isinstance((s.get("chart") or {}).get("title"), dict):
-            title = (s["chart"]["title"].get("text") or "")
-        title_safe = (title or "Chart")[:80].replace('"', '&quot;')
-        slot_json = json.dumps(s, default=str)
         items_html.append(f"""
           <div class="grid-stack-item"
                gs-x="{x}" gs-y="{y}" gs-w="{w}" gs-h="{h}"
-               gs-id="{source}"
-               data-slot='{slot_json}'>
+               gs-id="{source}">
             <div class="grid-stack-item-content tile">
-              <div class="tile-head">
-                <span class="tile-title" title="{title_safe}">{title_safe}</span>
-                <button class="tile-rm" data-source="{source}" title="Remove from canvas">✕</button>
-              </div>
+              <button class="tile-rm" data-source="{source}" title="Remove from canvas">✕</button>
               <div class="chart-host" id="chart-{source}"></div>
               <script type="application/json" class="chart-config">{chart_json}</script>
             </div>
@@ -247,20 +230,22 @@ def render_gridstack_canvas(slots: list[dict], draft_id: str, api_base: str,
         .grid-stack-item-content.tile {{
           background: #fff; border: 1px solid #e5e7eb; border-radius: 8px;
           box-shadow: 0 1px 3px rgba(0,0,0,.04); overflow: hidden;
-          display: flex; flex-direction: column; cursor: move;
+          cursor: move; position: relative;
         }}
-        .tile-head {{
-          padding: 6px 10px; border-bottom: 1px solid #f3f4f6;
-          display: flex; justify-content: space-between; align-items: center;
-          font-weight: 600; font-size: 13px; background: #fafafa;
-        }}
-        .tile-title {{ white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+        /* The chart fills the whole tile — no title bar, no script preview,
+           no data dump. Just the graph. */
+        .chart-host {{ width: 100%; height: 100%; padding: 4px; box-sizing: border-box; }}
+        /* Floating remove button in the top-right corner (only on hover so
+           it doesn't compete with the chart). */
         .tile-rm {{
-          border: 0; background: transparent; cursor: pointer; color: #991b1b;
-          font-size: 14px; padding: 0 4px;
+          position: absolute; top: 4px; right: 6px;
+          border: 0; background: rgba(255,255,255,.85); cursor: pointer;
+          color: #991b1b; font-size: 13px; padding: 2px 6px; border-radius: 4px;
+          opacity: 0; transition: opacity .15s ease; z-index: 5;
+          line-height: 1;
         }}
-        .tile-rm:hover {{ color: #dc2626; }}
-        .chart-host {{ flex: 1; padding: 4px; min-height: 0; }}
+        .grid-stack-item-content.tile:hover .tile-rm {{ opacity: 1; }}
+        .tile-rm:hover {{ color: #dc2626; background: #fff; }}
         .status {{ font-size: 12px; color: #6b7280; padding: 4px 2px; }}
         .status.saving {{ color: #2563eb; }}
         .status.saved  {{ color: #16a34a; }}
@@ -445,6 +430,19 @@ def api_delete_draft(draft_id: str):
     return r.status_code == 200
 
 
+def api_patch_template(template_id: str, **fields):
+    """Partial update on a template (title, selections, etc.)."""
+    body = {k: v for k, v in fields.items() if v is not None}
+    if not body:
+        return None
+    r = requests.patch(f"{API_BASE}/templates/{template_id}",
+                        json=_sanitize_for_json(body), timeout=15)
+    if r.status_code != 200:
+        st.error(f"Update template failed ({r.status_code}): {r.text[:200]}")
+        return None
+    return r.json()
+
+
 def api_list_thread_queries(thread_id: str):
     try:
         r = requests.get(f"{API_BASE}/threads/{thread_id}/queries", timeout=10)
@@ -498,45 +496,20 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
-    st.subheader("Saved templates")
     try:
-        t_resp = requests.get(f"{API_BASE}/templates", params={"user_id": user_id}, timeout=10)
-        templates = t_resp.json().get("templates", []) if t_resp.status_code == 200 else []
+        _t_resp = requests.get(f"{API_BASE}/templates",
+                               params={"user_id": user_id}, timeout=10)
+        _n_templates = len(_t_resp.json().get("templates", [])) if _t_resp.status_code == 200 else 0
     except Exception:
-        templates = []
-
-    if not templates:
-        st.caption("No saved templates yet.")
-    for t in templates:
-        tid = t["template_id"]
-        label = (t.get("title") or "Untitled")[:40]
-        col_open, col_del = st.columns([5, 1])
-        with col_open:
-            if st.button(f"📄 {label}", key=f"tpl_open_{tid}", use_container_width=True):
-                st.session_state.template_view = tid
-                st.rerun()
-        with col_del:
-            pending_key = f"_tpl_delete_pending_{tid}"
-            if st.session_state.get(pending_key):
-                if st.button("✓", key=f"tpl_del_confirm_{tid}", use_container_width=True):
-                    try:
-                        r = requests.delete(f"{API_BASE}/templates/{tid}", timeout=15)
-                        if r.status_code == 200:
-                            st.session_state.pop(pending_key, None)
-                            if st.session_state.get("template_view") == tid:
-                                st.session_state.template_view = None
-                            st.toast("Template deleted.", icon="🗑️")
-                            st.rerun()
-                        else:
-                            st.session_state.pop(pending_key, None)
-                            st.error(f"Delete failed ({r.status_code}): {r.text[:200]}")
-                    except Exception as e:
-                        st.session_state.pop(pending_key, None)
-                        st.error(f"Delete failed: {e}")
-            else:
-                if st.button("🗑", key=f"tpl_del_{tid}", use_container_width=True):
-                    st.session_state[pending_key] = True
-                    st.rerun()
+        _n_templates = 0
+    try:
+        _d_resp = requests.get(f"{API_BASE}/canvas/drafts",
+                               params={"user_id": user_id}, timeout=10)
+        _n_drafts = len(_d_resp.json().get("drafts", [])) if _d_resp.status_code == 200 else 0
+    except Exception:
+        _n_drafts = 0
+    st.caption(f"📚 **{_n_drafts}** canvas draft(s) · **{_n_templates}** template(s)")
+    st.caption("_Manage them in the **Canvas** and **Templates** tabs →_")
 
 
 # ── Rehydrate chat from the DB ──────────────────────────────────────────────
@@ -836,73 +809,69 @@ def _render_chart_card(q_rec: dict, chart: dict, idx: int, active_draft: dict | 
         if in_drafts else "➕ Add to canvas"
     )
 
-    col_a, col_b = st.columns([1, 1])
-    with col_a:
-        with st.popover(popover_label, use_container_width=True):
-            st.markdown("**Add this chart to a draft report**")
+    # Chat-side action: only "Add to canvas". Editing a chart lives in the
+    # Report canvas tab — pick the chart there, click ✏️ Edit. This keeps
+    # the chat read-only and stops two parallel edit surfaces from competing.
+    with st.popover(popover_label, use_container_width=True):
+        st.markdown("**Add this chart to a draft report**")
 
-            if drafts:
-                st.caption("Pick an existing draft:")
-                for d in drafts:
-                    did = d["draft_id"]
-                    n_slots = len(d.get("slots") or [])
-                    from_other_thread = d.get("thread_id") != current_thread
-                    already = _chart_in_draft(d, source_key)
-                    full = n_slots >= MAX_REPORT_CHARTS and not already
-                    dot = "🧵" if from_other_thread else "📄"
-                    if already:
-                        btn = f"✓ {dot} {d.get('name') or 'Untitled'} ({n_slots}/{MAX_REPORT_CHARTS})"
-                    elif full:
-                        btn = f"⛔ {dot} {d.get('name') or 'Untitled'} (full)"
-                    else:
-                        btn = f"{dot} {d.get('name') or 'Untitled'} ({n_slots}/{MAX_REPORT_CHARTS})"
-                    if st.button(
-                        btn,
-                        key=f"addto_{q_rec['query_id']}_{idx}_{did}",
-                        disabled=already or full,
-                        use_container_width=True,
-                        help=("From another thread" if from_other_thread else None),
-                    ):
-                        ok, msg = _add_chart_to_draft_by_id(did, q_rec, idx)
-                        st.toast(msg, icon="✅" if ok else "⚠️")
-                        if ok:
-                            st.session_state.active_draft_id = did
-                            st.rerun()
-                st.divider()
-
-            st.caption("…or start a new draft report:")
-            new_name = st.text_input(
-                "New draft name",
-                placeholder="e.g., Q2 Power Rollout Status",
-                key=f"newdraft_{q_rec['query_id']}_{idx}",
-                label_visibility="collapsed",
-            )
-            if st.button(
-                "➕ Create new draft & add",
-                key=f"newbtn_{q_rec['query_id']}_{idx}",
-                type="primary",
-                use_container_width=True,
-            ):
-                if not new_name.strip():
-                    st.warning("Give the new draft a name first.")
+        if drafts:
+            st.caption("Pick an existing draft:")
+            for d in drafts:
+                did = d["draft_id"]
+                n_slots = len(d.get("slots") or [])
+                from_other_thread = d.get("thread_id") != current_thread
+                already = _chart_in_draft(d, source_key)
+                full = n_slots >= MAX_REPORT_CHARTS and not already
+                dot = "🧵" if from_other_thread else "📄"
+                if already:
+                    btn = f"✓ {dot} {d.get('name') or 'Untitled'} ({n_slots}/{MAX_REPORT_CHARTS})"
+                elif full:
+                    btn = f"⛔ {dot} {d.get('name') or 'Untitled'} (full)"
                 else:
-                    row = api_create_draft(
-                        user_id, username, st.session_state.thread_id,
-                        new_name.strip(), project_type,
-                    )
-                    if row:
-                        ok, msg = _add_chart_to_draft(row, q_rec, idx)
-                        st.session_state.active_draft_id = row["draft_id"]
-                        st.toast(
-                            f"Created “{new_name.strip()}” and added the chart." if ok else msg,
-                            icon="✅" if ok else "⚠️",
-                        )
+                    btn = f"{dot} {d.get('name') or 'Untitled'} ({n_slots}/{MAX_REPORT_CHARTS})"
+                if st.button(
+                    btn,
+                    key=f"addto_{q_rec['query_id']}_{idx}_{did}",
+                    disabled=already or full,
+                    use_container_width=True,
+                    help=("From another thread" if from_other_thread else None),
+                ):
+                    ok, msg = _add_chart_to_draft_by_id(did, q_rec, idx)
+                    st.toast(msg, icon="✅" if ok else "⚠️")
+                    if ok:
+                        st.session_state.active_draft_id = did
                         st.rerun()
+            st.divider()
 
-    with col_b:
-        if st.button("✏️ Edit chart", key=f"edit_btn_{q_rec['query_id']}_{idx}",
-                     use_container_width=True):
-            _edit_chart_dialog(q_rec["query_id"], idx, title)
+        st.caption("…or start a new draft report:")
+        new_name = st.text_input(
+            "New draft name",
+            placeholder="e.g., Q2 Power Rollout Status",
+            key=f"newdraft_{q_rec['query_id']}_{idx}",
+            label_visibility="collapsed",
+        )
+        if st.button(
+            "➕ Create new draft & add",
+            key=f"newbtn_{q_rec['query_id']}_{idx}",
+            type="primary",
+            use_container_width=True,
+        ):
+            if not new_name.strip():
+                st.warning("Give the new draft a name first.")
+            else:
+                row = api_create_draft(
+                    user_id, username, st.session_state.thread_id,
+                    new_name.strip(), project_type,
+                )
+                if row:
+                    ok, msg = _add_chart_to_draft(row, q_rec, idx)
+                    st.session_state.active_draft_id = row["draft_id"]
+                    st.toast(
+                        f"Created “{new_name.strip()}” and added the chart." if ok else msg,
+                        icon="✅" if ok else "⚠️",
+                    )
+                    st.rerun()
 
 
 # ── LEFT (chat) · RIGHT (canvas) layout ────────────────────────────────────
@@ -947,40 +916,39 @@ with col_chat:
         st.warning("Please enter a question.")
 
 
-# ── RIGHT: Canvas column ────────────────────────────────────────────────────
+# ── RIGHT: Canvas + Templates tabs ──────────────────────────────────────────
 
 with col_canvas:
+    # Pull a fresh template list once so the tab badges show counts
+    try:
+        _t_list_resp = requests.get(
+            f"{API_BASE}/templates", params={"user_id": user_id}, timeout=10,
+        )
+        templates_for_right = (
+            _t_list_resp.json().get("templates", [])
+            if _t_list_resp.status_code == 200 else []
+        )
+    except Exception:
+        templates_for_right = []
+
+    tab_canvas_pane, tab_templates_pane = st.tabs([
+        f"🎨 Canvas ({len(drafts)})",
+        f"📄 Templates ({len(templates_for_right)})",
+    ])
+
+
+# ============================================================================
+# CANVAS TAB
+# ============================================================================
+with tab_canvas_pane:
     st.subheader("🎨 Report canvas")
 
-    # Draft selector + "new draft" popover
-    sel_col, new_col = st.columns([3, 2])
-    with sel_col:
-        if drafts:
-            draft_ids = [d["draft_id"] for d in drafts]
-            labels = {}
-            for d in drafts:
-                dot = "📄" if d.get("thread_id") == current_thread else "🧵"
-                labels[d["draft_id"]] = (
-                    f"{dot} {(d.get('name') or 'Untitled')[:28]} "
-                    f"({len(d.get('slots') or [])}/{MAX_REPORT_CHARTS})"
-                )
-            idx = draft_ids.index(st.session_state.active_draft_id) if st.session_state.active_draft_id in draft_ids else 0
-            picked = st.selectbox(
-                f"Active draft ({len(drafts)} total)",
-                options=draft_ids,
-                index=idx,
-                format_func=lambda x: labels[x],
-                label_visibility="collapsed",
-                help="📄 = this thread · 🧵 = from another thread",
-            )
-            if picked != st.session_state.active_draft_id:
-                st.session_state.active_draft_id = picked
-                st.rerun()
-        else:
-            st.caption("No drafts yet — click **➕ New draft** or use **Add to canvas** from any chart.")
+    # ── Card-style list of all drafts at the top ──────────────────────────
+    list_col, new_col = st.columns([4, 1])
     with new_col:
         with st.popover("➕ New draft", use_container_width=True):
-            new_name = st.text_input("Draft name", placeholder="e.g., Q2 Power Rollout Status",
+            new_name = st.text_input("Draft name",
+                                     placeholder="e.g., Q2 Power Rollout Status",
                                      key="_new_draft_name")
             if st.button("Create", type="primary", use_container_width=True):
                 if not new_name.strip():
@@ -992,6 +960,64 @@ with col_canvas:
                         st.session_state.active_draft_id = row["draft_id"]
                         st.toast(f"Created “{new_name.strip()}”", icon="✅")
                         st.rerun()
+    with list_col:
+        st.caption(f"📚 **My canvases** · {len(drafts)} total"
+                   "  ·  📄 = this thread  ·  🧵 = from another thread")
+
+    if drafts:
+        # Render each draft as a clickable card row.
+        for d in drafts:
+            did = d["draft_id"]
+            is_active = (did == st.session_state.active_draft_id)
+            from_this_thread = (d.get("thread_id") == current_thread)
+            dot = "📄" if from_this_thread else "🧵"
+            n_slots = len(d.get("slots") or [])
+            updated = str(d.get("updated_at") or "")[:19]
+
+            border_color = "#2563eb" if is_active else "#e5e7eb"
+            bg = "rgba(37, 99, 235, 0.06)" if is_active else "transparent"
+            with st.container(border=False):
+                st.markdown(
+                    f"<div style='padding:10px 12px;border:1px solid {border_color};"
+                    f"border-radius:8px;background:{bg};margin-bottom:6px;"
+                    f"display:flex;align-items:center;justify-content:space-between;'>"
+                    f"<div><b>{dot} {(d.get('name') or 'Untitled')}</b>"
+                    f"  <span style='color:#6b7280;font-size:0.85em;'>"
+                    f"· {n_slots}/{MAX_REPORT_CHARTS} charts · updated {updated}</span></div>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+                col_open, col_del = st.columns([5, 1])
+                with col_open:
+                    if not is_active:
+                        if st.button(f"Open “{(d.get('name') or 'Untitled')[:30]}”",
+                                     key=f"open_draft_{did}", use_container_width=True):
+                            st.session_state.active_draft_id = did
+                            st.rerun()
+                    else:
+                        st.caption("✅ Currently editing this canvas below.")
+                with col_del:
+                    pk = f"_draft_card_del_{did}"
+                    if st.session_state.get(pk):
+                        if st.button("✓", key=f"draft_card_del_ok_{did}",
+                                     use_container_width=True, help="Confirm delete"):
+                            api_delete_draft(did)
+                            st.session_state.pop(pk, None)
+                            if st.session_state.active_draft_id == did:
+                                st.session_state.active_draft_id = None
+                            st.toast("Draft deleted.", icon="🗑️")
+                            st.rerun()
+                    else:
+                        if st.button("🗑", key=f"draft_card_del_{did}",
+                                     use_container_width=True,
+                                     help="Delete this draft (click again to confirm)"):
+                            st.session_state[pk] = True
+                            st.rerun()
+    else:
+        st.info("No canvas drafts yet. Use **➕ New draft** above, or click "
+                "**Add to canvas** under any chart in the chat.")
+
+    st.divider()
 
     # Refetch the active draft from the just-fetched drafts list
     active_draft = next((d for d in drafts if d["draft_id"] == st.session_state.active_draft_id), None)
@@ -1059,30 +1085,107 @@ with col_canvas:
                     "each new chart lands in the first free grid spot. After that, drag and "
                     "resize tiles here to arrange the page.")
         else:
-            # Compact slot list below the canvas so the user can see insight /
-            # script details without re-opening each tile. No drag here — the
-            # 2D canvas above is the single source of truth for positioning.
-            with st.expander("📋 Slot details (insight + script per tile)"):
-                for s in sorted(slots, key=lambda x: (int(x.get("y", 0)), int(x.get("x", 0)))):
-                    st.markdown(
-                        f"**[{s.get('x', 0)},{s.get('y', 0)}] "
-                        f"{s.get('w', '?')}×{s.get('h', '?')}** · "
-                        f"{((s.get('chart') or {}).get('title') or {}).get('text', 'chart')}"
+            # ── Quick edit — select a canvas tile and patch it in-place ────
+            # Edits flow through POST /charts/edit which updates the chart in
+            # reporting_agent_queries.charts[idx] and propagates back into
+            # every draft + linked template that holds this chart.
+            sorted_slots = sorted(slots, key=lambda x: (int(x.get("y", 0)), int(x.get("x", 0))))
+            slot_titles = {}
+            for s in sorted_slots:
+                t = ((s.get("chart") or {}).get("title") or {}).get("text") if isinstance(
+                    (s.get("chart") or {}).get("title"), dict) else (s.get("chart") or {}).get("title")
+                slot_titles[_slot_source(s)] = t or "Chart"
+
+            with st.container(border=True):
+                st.markdown("##### ✏️ Edit a chart on the canvas")
+                ed_sel, ed_btn = st.columns([4, 1])
+                with ed_sel:
+                    sk_options = list(slot_titles.keys())
+                    picked_sk = st.selectbox(
+                        "Which chart?",
+                        options=sk_options,
+                        format_func=lambda sk: f"{slot_titles[sk]}",
+                        key=f"edit_slot_pick_{active_draft['draft_id']}",
+                        label_visibility="collapsed",
                     )
+                with ed_btn:
+                    if st.button("✏️ Edit chart",
+                                 key=f"edit_slot_btn_{active_draft['draft_id']}",
+                                 use_container_width=True,
+                                 help="Open the natural-language edit dialog for the picked chart"):
+                        picked_slot = next((s for s in sorted_slots
+                                            if _slot_source(s) == picked_sk), None)
+                        if picked_slot:
+                            _edit_chart_dialog(
+                                picked_slot["query_id"],
+                                picked_slot["chart_index"],
+                                slot_titles[picked_sk],
+                            )
+
+                st.caption("_Changes also update the same chart in the chat and in any finalized "
+                           "template linked to this canvas._")
+
+            # ── Per-tile details panel with inline edit buttons ───────────
+            with st.expander("📋 Slot details (insight · script · edit)"):
+                for s in sorted_slots:
+                    cols_hdr, cols_edit = st.columns([5, 1])
+                    with cols_hdr:
+                        st.markdown(
+                            f"**[{s.get('x', 0)},{s.get('y', 0)}] "
+                            f"{s.get('w', '?')}×{s.get('h', '?')}** · "
+                            f"{slot_titles[_slot_source(s)]}"
+                        )
+                    with cols_edit:
+                        if st.button(
+                            "✏️ Edit",
+                            key=f"edit_slot_inline_{active_draft['draft_id']}_{_slot_source(s)}",
+                            use_container_width=True,
+                        ):
+                            _edit_chart_dialog(
+                                s["query_id"],
+                                s["chart_index"],
+                                slot_titles[_slot_source(s)],
+                            )
                     slot_insight = (s.get("chart") or {}).get("insight")
                     if slot_insight:
                         render_insight(slot_insight, header="💡 Insight")
                     ev = s.get("evidence") or {}
                     st.code(ev.get("code") or "(no script)", language="python")
+                    # Show edit history (if any) so the user sees what's been
+                    # applied to this chart over time.
+                    history = (s.get("chart") or {}).get("_edit_history") or []
+                    if history:
+                        st.caption(
+                            f"Edits applied: {', '.join((h.get('instruction') or '')[:50] for h in history[-3:])}"
+                            + (" …" if len(history) > 3 else "")
+                        )
                     st.divider()
 
         st.divider()
-        # Finalize
+        # Finalize — upserts by source_draft_id. If a template was already
+        # finalized from this canvas, the existing template is updated in
+        # place (title + slots + last_rendered) so we don't accumulate
+        # duplicates every time the user clicks Finalize.
+        existing_tpl_for_draft = next(
+            (t for t in templates_for_right
+             if t.get("source_draft_id") == active_draft["draft_id"]),
+            None,
+        )
+        finalize_label = (
+            f"💾 Update existing report: “{(existing_tpl_for_draft.get('title') or 'Untitled')[:30]}”"
+            if existing_tpl_for_draft else "🆕 Finalize as new template"
+        )
+        default_title = (
+            existing_tpl_for_draft.get("title") if existing_tpl_for_draft
+            else (active_draft.get("name") or "")
+        )
         with st.form(f"finalize_{active_draft['draft_id']}"):
-            ftitle = st.text_input("Report title", value=active_draft.get("name") or "")
-            finalize = st.form_submit_button("Finalize report (save as template)",
-                                             type="primary", use_container_width=True,
-                                             disabled=not slots)
+            ftitle = st.text_input("Report title", value=default_title)
+            finalize = st.form_submit_button(
+                finalize_label,
+                type="primary", use_container_width=True,
+                disabled=not slots,
+            )
         if finalize:
             # `slots` is already sorted by .position from the drag-drop handler.
             # `source_draft_id` links the finalized template back to this
@@ -1109,118 +1212,171 @@ with col_canvas:
                 resp = requests.post(f"{API_BASE}/templates",
                                      json=_sanitize_for_json(payload), timeout=30)
                 if resp.status_code == 200:
-                    tid = resp.json().get("template_id")
-                    st.success("Template saved. Scroll down to the Saved template view.")
+                    body = resp.json()
+                    tid = body.get("template_id")
+                    action = body.get("action") or "saved"
+                    st.success(
+                        f"Template **{action}**. Open the **📄 Templates** tab to view it."
+                    )
                     st.session_state.template_view = tid
+                    st.rerun()
                 else:
                     st.error(f"Save failed ({resp.status_code}): {resp.text[:200]}")
             except Exception as e:
                 st.error(f"Save failed: {e}")
 
 
-# ── Bottom: Saved template view ─────────────────────────────────────────────
+# ============================================================================
+# TEMPLATES TAB
+# ============================================================================
+with tab_templates_pane:
+    st.subheader("📄 Saved templates")
 
-st.divider()
-with st.expander("📄 Saved template view", expanded=bool(st.session_state.template_view)):
-    try:
-        r = requests.get(f"{API_BASE}/templates", params={"user_id": user_id}, timeout=10)
-        tpls = r.json().get("templates", []) if r.status_code == 200 else []
-    except Exception:
-        tpls = []
+    tpls = templates_for_right  # already fetched above for the tab badge
 
     if not tpls:
-        st.info("You haven't saved any templates yet.")
+        st.info("You haven't saved any templates yet. Build a canvas, click **Finalize**, and it lands here.")
     else:
-        ids = [t["template_id"] for t in tpls]
-        titles = {t["template_id"]: (t.get("title") or "Untitled") for t in tpls}
+        # Resolve which template is currently focused.
         tid = st.session_state.template_view
-        if tid and tid not in ids:
+        valid_tids = {t["template_id"] for t in tpls}
+        if tid and tid not in valid_tids:
             tid = None
+            st.session_state.template_view = None
         if not tid:
-            tid = ids[0]
+            tid = tpls[0]["template_id"]
             st.session_state.template_view = tid
 
-        picked = st.selectbox(
-            "Template",
-            options=ids,
-            index=ids.index(tid),
-            format_func=lambda x: f"📄 {titles[x]}",
-        )
-        if picked != tid:
-            st.session_state.template_view = picked
-            tid = picked
-            st.rerun()
+        st.caption(f"📚 **My templates** · {len(tpls)} total")
 
-        head, btn, btn_del = st.columns([3, 1, 1])
-        with head:
-            st.markdown(f"### {titles[tid]}")
-        with btn:
-            re_run = st.button("▶ Re-run with today's data", type="primary",
-                               use_container_width=True)
-        with btn_del:
-            del_key = f"_tpl_view_del_{tid}"
-            if st.session_state.get(del_key):
-                if st.button("✓ Confirm", key=f"tv_ok_{tid}", use_container_width=True):
-                    try:
-                        r = requests.delete(f"{API_BASE}/templates/{tid}", timeout=15)
-                        if r.status_code == 200:
-                            st.session_state.pop(del_key, None)
-                            st.session_state.pop(f"_rendered_{tid}", None)
-                            st.session_state.template_view = None
-                            st.toast("Template deleted.", icon="🗑️")
-                            st.rerun()
-                        else:
-                            st.session_state.pop(del_key, None)
-                            st.error(f"Delete failed ({r.status_code}): {r.text[:200]}")
-                    except Exception as e:
-                        st.session_state.pop(del_key, None)
-                        st.error(f"Delete failed: {e}")
-            else:
-                if st.button("🗑 Delete", key=f"tv_del_{tid}", use_container_width=True):
-                    st.session_state[del_key] = True
-                    st.rerun()
+        # ── Card list of templates ──────────────────────────────────────
+        for t in tpls:
+            t_tid = t["template_id"]
+            is_open = (t_tid == tid)
+            sels = t.get("selections")
+            if isinstance(sels, str):
+                try:
+                    sels = json.loads(sels)
+                except Exception:
+                    sels = []
+            n_charts = len(sels or [])
+            t_title = t.get("title") or "Untitled"
+            t_proj = t.get("project_type") or "-"
+            t_created = str(t.get("created_at") or "")[:19]
+            t_last_run = str(t.get("last_run_at") or "")[:19] or "—"
 
-        # Fetch metadata
-        meta = {}
+            border_color = "#16a34a" if is_open else "#e5e7eb"
+            bg = "rgba(22, 163, 74, 0.06)" if is_open else "transparent"
+            st.markdown(
+                f"<div style='padding:10px 12px;border:1px solid {border_color};"
+                f"border-radius:8px;background:{bg};margin-bottom:6px;'>"
+                f"<div style='font-weight:600;'>📄 {t_title}</div>"
+                f"<div style='color:#6b7280;font-size:0.85em;margin-top:2px;'>"
+                f"{n_charts} chart{'s' if n_charts != 1 else ''} · "
+                f"project: <code>{t_proj}</code> · "
+                f"created: <code>{t_created}</code> · "
+                f"last run: <code>{t_last_run}</code>"
+                f"</div></div>",
+                unsafe_allow_html=True,
+            )
+            # Rename row — inline text input + Save button
+            ren_col, save_col = st.columns([5, 1])
+            with ren_col:
+                renamed = st.text_input(
+                    "Rename template", value=t_title,
+                    key=f"tpl_rename_input_{t_tid}",
+                    label_visibility="collapsed",
+                )
+            with save_col:
+                if st.button("💾 Save", key=f"tpl_rename_save_{t_tid}",
+                             use_container_width=True,
+                             disabled=not renamed.strip() or renamed.strip() == t_title,
+                             help="Save the new template name"):
+                    if api_patch_template(t_tid, title=renamed.strip()):
+                        st.toast("Renamed.", icon="✏️")
+                        st.rerun()
+
+            col_open, col_run, col_del = st.columns([3, 2, 1])
+            with col_open:
+                if not is_open:
+                    if st.button(f"Open “{(renamed or t_title)[:30]}”",
+                                 key=f"tpl_card_open_{t_tid}", use_container_width=True):
+                        st.session_state.template_view = t_tid
+                        st.rerun()
+                else:
+                    st.caption("✅ Currently viewing this template below.")
+            with col_run:
+                if st.button("▶ Re-run", key=f"tpl_card_run_{t_tid}",
+                             type="primary", use_container_width=True):
+                    with st.spinner("Re-running scripts…"):
+                        try:
+                            resp = requests.post(f"{API_BASE}/templates/{t_tid}/run", timeout=600)
+                            if resp.status_code == 200:
+                                st.session_state[f"_rendered_{t_tid}"] = resp.json()
+                                st.session_state.template_view = t_tid
+                                st.toast("Refreshed.", icon="🔄")
+                                st.rerun()
+                            else:
+                                st.error(f"Re-run failed ({resp.status_code})")
+                        except Exception as e:
+                            st.error(f"Re-run failed: {e}")
+            with col_del:
+                pk = f"_tpl_card_del_{t_tid}"
+                if st.session_state.get(pk):
+                    if st.button("✓", key=f"tpl_card_del_ok_{t_tid}",
+                                 use_container_width=True, help="Confirm delete"):
+                        try:
+                            r = requests.delete(f"{API_BASE}/templates/{t_tid}", timeout=15)
+                            if r.status_code == 200:
+                                st.session_state.pop(pk, None)
+                                st.session_state.pop(f"_rendered_{t_tid}", None)
+                                if st.session_state.template_view == t_tid:
+                                    st.session_state.template_view = None
+                                st.toast("Template deleted.", icon="🗑️")
+                                st.rerun()
+                            else:
+                                st.session_state.pop(pk, None)
+                                st.error(f"Delete failed ({r.status_code})")
+                        except Exception as e:
+                            st.session_state.pop(pk, None)
+                            st.error(f"Delete failed: {e}")
+                else:
+                    if st.button("🗑", key=f"tpl_card_del_{t_tid}",
+                                 use_container_width=True,
+                                 help="Delete (click again to confirm)"):
+                        st.session_state[pk] = True
+                        st.rerun()
+
+        st.divider()
+
+        # ── Render the currently-open template below the list ───────────
         try:
             mr = requests.get(f"{API_BASE}/templates/{tid}", timeout=15)
-            if mr.status_code == 200:
-                meta = mr.json()
+            meta = mr.json() if mr.status_code == 200 else {}
         except Exception as e:
+            meta = {}
             st.error(f"Could not load template: {e}")
 
         if meta:
+            st.markdown(f"### 📄 {meta.get('title', '')}")
             st.caption(
                 f"project_type: `{meta.get('project_type') or '-'}` · "
                 f"created: `{meta.get('created_at', '')}` · "
                 f"last_run: `{meta.get('last_run_at', '')}`"
             )
+
             selections = meta.get("selections") or []
             if isinstance(selections, str):
                 try:
                     selections = json.loads(selections)
                 except Exception:
                     selections = []
-            # Respect saved drag-drop order. Fallback to current index for
-            # templates saved before positions were persisted.
             selections = sorted(
                 selections,
                 key=lambda s: int(s.get("position", 0)
                                   if s.get("position") is not None
                                   else selections.index(s)),
             )
-
-            if re_run:
-                with st.spinner("Re-running all scripts..."):
-                    try:
-                        resp = requests.post(f"{API_BASE}/templates/{tid}/run", timeout=600)
-                        if resp.status_code == 200:
-                            st.session_state[f"_rendered_{tid}"] = resp.json()
-                            st.success("Refreshed.")
-                        else:
-                            st.error(f"Re-run failed ({resp.status_code}): {resp.text[:200]}")
-                    except Exception as e:
-                        st.error(f"Re-run failed: {e}")
 
             rendered = st.session_state.get(f"_rendered_{tid}")
             if rendered is None:
@@ -1249,32 +1405,23 @@ with st.expander("📄 Saved template view", expanded=bool(st.session_state.temp
             if not charts_to_show:
                 st.warning("This template has no charts to render.")
             else:
-                # Render charts at their saved x/y/w/h so the re-run page
-                # reproduces the exact layout the user arranged on the canvas.
+                # Render at saved x/y/w/h so the page reproduces the canvas layout.
                 layout_slots = []
                 for i, c in enumerate(charts_to_show):
                     sel = selections[i] if i < len(selections) else {}
-                    # Prefer layout from the selection (drag-drop at finalize
-                    # time); fall back to a sensible default if missing.
                     x = int(sel.get("x", (i % 2) * 6) or 0)
                     y = int(sel.get("y", (i // 2) * 4) or 0)
                     w = int(sel.get("w", 6) or 6)
                     h = int(sel.get("h", 4) or 4)
-                    layout_slots.append({
-                        "x": x, "y": y, "w": w, "h": h,
-                        "chart": c,
-                    })
-                grid_height = max(
-                    420,
-                    80 * max([s["y"] + s["h"] for s in layout_slots], default=6) + 80,
-                )
+                    layout_slots.append({"x": x, "y": y, "w": w, "h": h, "chart": c})
+                grid_height = max(420,
+                                  80 * max([s["y"] + s["h"] for s in layout_slots], default=6) + 80)
                 render_readonly_grid(
                     slots=layout_slots,
                     container_key=f"tpl-{tid}",
                     height=grid_height,
                 )
 
-                # Detail panel underneath: description / insight / script per chart.
                 with st.expander("📋 Chart details (description · insight · script)"):
                     for i, chart in enumerate(charts_to_show):
                         title = "Chart"
