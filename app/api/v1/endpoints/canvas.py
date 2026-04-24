@@ -22,10 +22,12 @@ import uuid
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from models.chart_types import Chart
 from services import db_service
+from services.canvas_export import _safe_filename, render_canvas_pdf
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Canvas"])
@@ -58,38 +60,39 @@ _EXAMPLE_CHART: dict[str, Any] = {
 }
 
 _EXAMPLE_SLOT: dict[str, Any] = {
-    "query_id":       "23237b8e-a963-459e-920a-3ffbafa1f015",
-    "chart":          _EXAMPLE_CHART,   # chart.script is the script — no duplicate at slot level
-    "original_query": "give the GC run rate region wise",
-    "x": 0, "y": 0, "w": 6, "h": 4,
+    # Minimum payload — only chart + free-form (x, y, w, h) as fractions
+    # of the canvas viewport. A slot is just "this chart at this spot on
+    # the canvas".  Provenance (which query produced the chart, the
+    # original NL question) lives ON the chart row, not on the slot.
+    "chart": _EXAMPLE_CHART,
+    "x": 0.0, "y": 0.0, "w": 0.5, "h": 0.4,
 }
 
 
 class CanvasSlot(BaseModel):
     """One chart slot inside a canvas draft.
 
-    Copy each chart from the `/report/stream` complete event into a slot:
+    Coordinates are FREE-FORM — whatever the UI sends is stored verbatim.
+    No bounds, no clamping, no rounding. Conventions the UI is expected
+    to follow (but server does NOT enforce):
 
-      * `query_id` ← `stream_started.query_id`
-      * `chart`    ← `complete.charts[i]`   (the whole object — paste it as-is.
-                                              `chart.script` is what powers re-run.)
+      * `x`, `y` — top-left of the tile (fractions of the canvas, pixels,
+                   whatever scale the UI uses; server doesn't care)
+      * `w`, `h` — width / height of the tile, same scale as x/y
 
-    Layout (`x`, `y`, `w`, `h`, `position`) is optional — the server auto-places
-    new tiles in the first free spot on the 12-column grid.
+    The ONLY required field is `chart`. If layout is omitted the server
+    drops the slot at (0, max_y_so_far) with default size 0.5 × 0.4.
     """
-    query_id: str = Field(..., description="From SSE stream_started.query_id")
     chart:    Chart = Field(..., description="Full chart object — strict per-type schema (cartesian or pie). chart_id, script, insight, colors are required.")
 
-    original_query: str = Field(default="", description="The NL question that produced the chart")
-
-    x:        int | None = Field(default=None, ge=0, le=11, description="Column offset 0..11 on the 12-col grid")
-    y:        int | None = Field(default=None, ge=0,        description="Row offset (≥0)")
-    w:        int | None = Field(default=None, ge=1, le=12, description="Width in cols 1..12")
-    h:        int | None = Field(default=None, ge=1,        description="Height in rows ≥1")
-    position: int | None = Field(default=None, ge=0,        description="Legacy list order; server re-derives from (y, x)")
+    x:        float | None = Field(default=None, description="Left edge of the tile (UI's coordinate system)")
+    y:        float | None = Field(default=None, description="Top edge of the tile")
+    w:        float | None = Field(default=None, description="Tile width")
+    h:        float | None = Field(default=None, description="Tile height")
+    position: int   | None = Field(default=None, description="Legacy list order; server re-derives from (y, x)")
 
     model_config = ConfigDict(
-        extra="ignore",                      # → no `additionalProp1` in Swagger
+        extra="ignore",
         json_schema_extra={"example": _EXAMPLE_SLOT},
     )
 
@@ -101,16 +104,39 @@ class CanvasDraftCreate(BaseModel):
 
 
 class CanvasDraftPatch(BaseModel):
-    """Partial update. Send any subset of `name` / `slots`."""
-    name:  str | None = None
-    slots: list[CanvasSlot] | None = None
+    """Partial update — send any subset of `name` / `slots`.
+
+    `name` is OPTIONAL: omit it (or send null) to keep the draft's existing
+    name. Only include it when you're actually renaming.
+
+    `slots` is OPTIONAL: omit it (or send null) to keep the existing slots.
+    When provided, it REPLACES the entire slot list (slots not in the
+    payload are removed).
+    """
+    name:  str | None = Field(
+        default=None,
+        description="Omit to keep the existing name. Only set when renaming.",
+    )
+    slots: list[CanvasSlot] | None = Field(
+        default=None,
+        description="Omit to keep existing slots. When set, REPLACES the slot list (max 6).",
+    )
+
+    model_config = ConfigDict(
+        extra="ignore",
+        # Swagger example: only `slots` — the most common PATCH (add/move tiles).
+        # Renaming alone is rare; the docstring covers it.
+        json_schema_extra={"example": {"slots": [_EXAMPLE_SLOT]}},
+    )
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
+#
+# Free-form layout — server stores x/y/w/h verbatim. No clamping, no bounds
+# checks. The UI is fully in charge of layout.
 
-GRID_COLS = 12
-DEFAULT_W = 6    # half-width tile (2 per row)
-DEFAULT_H = 4    # ~320 px tall at 80 px row height
+DEFAULT_W = 0.5     # only used when the UI omits a slot's size entirely
+DEFAULT_H = 0.4
 
 
 def _has_layout(s: dict) -> bool:
@@ -118,86 +144,65 @@ def _has_layout(s: dict) -> bool:
 
 
 def _assign_default_layout(slot: dict, already_placed: list[dict]) -> dict:
-    """Pack an un-laid-out slot into the first available slot on the grid.
-
-    We walk existing placements row-by-row and drop the new tile into the
-    first gap big enough to hold DEFAULT_W × DEFAULT_H. Falling back to
-    appending at the bottom if no gap fits.
-    """
-    slot["w"] = slot.get("w") or DEFAULT_W
-    slot["h"] = slot.get("h") or DEFAULT_H
-    slot["w"] = min(GRID_COLS, max(1, slot["w"]))
-    slot["h"] = max(1, slot["h"])
-
-    # Try to fit into each row from top, scanning columns.
-    if already_placed:
-        max_y = max((int(p["y"]) + int(p["h"])) for p in already_placed) + slot["h"] + 1
+    """Fallback when the UI sends a slot with no x/y/w/h — drop it at
+    (0, max_y) so it sits below everything that's already placed."""
+    slot["w"] = float(slot.get("w") if slot.get("w") is not None else DEFAULT_W)
+    slot["h"] = float(slot.get("h") if slot.get("h") is not None else DEFAULT_H)
+    slot["x"] = float(slot.get("x") if slot.get("x") is not None else 0.0)
+    if slot.get("y") is None:
+        max_y = max(
+            (float(p["y"]) + float(p["h"]) for p in already_placed),
+            default=0.0,
+        )
+        slot["y"] = max_y
     else:
-        max_y = slot["h"] + 1
-
-    for y in range(max_y):
-        for x in range(GRID_COLS - slot["w"] + 1):
-            collides = False
-            for p in already_placed:
-                px, py, pw, ph = int(p["x"]), int(p["y"]), int(p["w"]), int(p["h"])
-                if (x < px + pw and x + slot["w"] > px
-                        and y < py + ph and y + slot["h"] > py):
-                    collides = True
-                    break
-            if not collides:
-                slot["x"], slot["y"] = x, y
-                return slot
-
-    # Should never reach — but fall back to bottom-left.
-    slot["x"] = 0
-    slot["y"] = max_y
+        slot["y"] = float(slot["y"])
     return slot
 
 
 def _normalise_positions(slots: list[dict]) -> list[dict]:
-    """Ensure every slot has an x/y/w/h layout, then renumber `position`
-    from the 2D order (top-to-bottom, left-to-right) so list and grid views
-    agree."""
+    """Coerce x/y/w/h to floats and renumber `position` from 2D order
+    (top-to-bottom, left-to-right). NO clamping — values pass through
+    exactly as the UI sent them."""
     placed: list[dict] = []
-
-    # First pass: accept existing layouts, defer un-placed ones.
     unplaced: list[dict] = []
+
     for s in slots:
         if _has_layout(s):
-            # Defensive clamp
-            s["x"] = max(0, min(GRID_COLS - 1, int(s["x"])))
-            s["w"] = max(1, min(GRID_COLS, int(s["w"])))
-            if s["x"] + s["w"] > GRID_COLS:
-                s["w"] = GRID_COLS - s["x"]
-            s["y"] = max(0, int(s["y"]))
-            s["h"] = max(1, int(s["h"]))
+            s["x"] = float(s["x"]); s["y"] = float(s["y"])
+            s["w"] = float(s["w"]); s["h"] = float(s["h"])
             placed.append(s)
         else:
             unplaced.append(s)
 
-    # Second pass: auto-place newcomers into the first free spot.
     for s in unplaced:
         _assign_default_layout(s, placed)
         placed.append(s)
 
-    # Recompute `position` from 2D order (row-major, top-to-bottom).
-    placed.sort(key=lambda s: (int(s["y"]), int(s["x"])))
+    placed.sort(key=lambda s: (float(s["y"]), float(s["x"])))
     for i, s in enumerate(placed):
         s["position"] = i
-
     return placed
 
 
 # ── Endpoints ───────────────────────────────────────────────────────────────
 
-@router.get("/canvas/drafts", summary="List canvas drafts for a user")
+@router.get(
+    "/canvas/drafts",
+    summary="List canvas drafts for a user (each with slots + reconstructed charts inlined)",
+)
 def list_drafts(
     user_id: str = Query(..., description="Owner of the drafts"),
     limit:   int = Query(default=50, le=200),
 ):
-    """Canvas drafts are USER-scoped — a single canvas can mix charts the
-    user collected from any number of chat threads. There is no thread filter."""
-    return {"drafts": db_service.list_canvas_drafts(user_id, limit=limit)}
+    """One round-trip — every draft plus every slot (with the chart fully
+    reconstructed from `reporting_agent_charts`). Canvas drafts are
+    USER-scoped — a single canvas can mix charts the user collected from
+    any number of chat threads. There is no thread filter."""
+    drafts = db_service.list_canvas_drafts(user_id, limit=limit)
+    for d in drafts:
+        d["slots"] = db_service.list_canvas_slots(d["draft_id"])
+    return {"drafts": drafts}
 
 
 @router.post("/canvas/drafts", summary="Create a new empty canvas draft")
@@ -274,9 +279,7 @@ def patch_draft(draft_id: str, payload: CanvasDraftPatch):
                     slot_chart_id = src_chart_id
 
             slot_specs.append({
-                "chart_id":       slot_chart_id,
-                "query_id":       s.get("query_id") or "",
-                "original_query": s.get("original_query") or "",
+                "chart_id": slot_chart_id,
                 "x": s["x"], "y": s["y"], "w": s["w"], "h": s["h"], "position": s["position"],
             })
 
@@ -301,3 +304,80 @@ def delete_draft(draft_id: str):
     if not ok:
         raise HTTPException(status_code=500, detail="Delete failed")
     return {"draft_id": draft_id, "deleted": True}
+
+
+def _load_owned_draft(draft_id: str, user_id: str) -> dict:
+    """Fetch a draft (with slots) and verify it belongs to user_id.
+
+    Raises 404 if the draft doesn't exist; 403 if it belongs to someone else.
+    """
+    draft = db_service.get_canvas_draft(draft_id)
+    if not draft:
+        raise HTTPException(status_code=404, detail=f"Draft {draft_id} not found")
+    if draft.get("user_id") != user_id:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Draft {draft_id} does not belong to user {user_id}",
+        )
+    return draft
+
+
+@router.get(
+    "/canvas/drafts/{draft_id}/download.pdf",
+    summary="Download the canvas as a PDF (browser saves the file directly)",
+    response_class=Response,
+)
+def download_canvas_pdf(
+    draft_id: str,
+    user_id: str = Query(..., description="Owner — server verifies the draft belongs to this user"),
+):
+    """Render the draft as a single PDF page (landscape A4) preserving the
+    saved (x/y/w/h) tile layout. Charts drawn server-side (matplotlib);
+    each tile shows the chart with the insight underneath.
+
+    Returns the PDF bytes directly with a `Content-Disposition: attachment`
+    header — the browser downloads it as a normal file. No base64 wrapping.
+    """
+    draft = _load_owned_draft(draft_id, user_id)
+    title = draft.get("name") or "Canvas Report"
+    pdf   = render_canvas_pdf(title, draft.get("slots") or [])
+    fname = f"{_safe_filename(title)}.pdf"
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+@router.get(
+    "/canvas/drafts/{draft_id}/base64",
+    summary="Same PDF as /download.pdf but returned as a base64-encoded JSON payload",
+)
+def canvas_pdf_base64(
+    draft_id: str,
+    user_id: str = Query(..., description="Owner — server verifies the draft belongs to this user"),
+):
+    """Identical PDF pipeline as `/download.pdf` (one chart per page,
+    matplotlib-rendered charts, insight callout per chart). Differs only
+    in the transport: returns a JSON payload with the PDF base64-encoded
+    inside, for callers that prefer to decode client-side (e.g. embed in
+    a data-URL or persist to a CMS that expects base64 blobs).
+
+    Response shape:
+      {
+        "draft_id":       "<uuid>",
+        "filename":       "<title>.pdf",
+        "mime_type":      "application/pdf",
+        "content_base64": "<base64 of the pdf bytes>"
+      }
+    """
+    import base64 as _b64
+    draft = _load_owned_draft(draft_id, user_id)
+    title = draft.get("name") or "Canvas Report"
+    pdf   = render_canvas_pdf(title, draft.get("slots") or [])
+    return {
+        "draft_id":       draft_id,
+        "filename":       f"{_safe_filename(title)}.pdf",
+        "mime_type":      "application/pdf",
+        "content_base64": _b64.b64encode(pdf).decode("ascii"),
+    }

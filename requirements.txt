@@ -13,3 +13,7 @@ openai>=1.0.0
 streamlit>=1.40.0
 requests>=2.32.0
 streamlit-sortables>=0.3.1
+matplotlib>=3.9.0     # server-side chart rendering for PDF export
+reportlab>=4.0.0      # PDF document assembly (Platypus flow layout)
+markdown>=3.6         # PDF flow: build markdown first, then render the HTML
+openpyxl>=3.1         # Single-chart Excel export (cartesian + pie tabular data)

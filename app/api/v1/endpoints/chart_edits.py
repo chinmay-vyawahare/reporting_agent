@@ -1,28 +1,40 @@
 """
-Chart edit API — apply a natural-language styling edit to a saved chart.
+Chart edit API — apply a natural-language styling edit to a saved chart,
+plus per-chart downloads (PDF of the chart alone, Excel of its data).
 
 POST /api/v1/charts/edit
   body: { "chart_id": "...", "instruction": "make the bars red" }
   returns: { "chart_id": "...", "chart": {...patched} }
 
+GET  /api/v1/charts/edits?chart_id=...
+  returns the edit history for that chart (audit log: instruction + when).
+
+GET  /api/v1/charts/{chart_id}/download.pdf?user_id=...
+  single-chart PDF — ownership-checked. Same renderer the canvas / template
+  PDFs use (matplotlib chart image + insight callout).
+
+GET  /api/v1/charts/{chart_id}/download.xlsx?user_id=...
+  single-chart .xlsx — `About` sheet (title/subtitle/description/insight)
+  plus a `Data` sheet shaped for the chart type (cartesian → wide table
+  of category × series; pie → name/value/%).
+
 The edit is **canvas-scoped by construction**: every chart added to a canvas
 gets its own cloned chart_id (see canvas PATCH endpoint), so editing a
 chart_id only mutates that one row — it never leaks back into the chat or
-into another canvas. The linked template's selection points at the SAME
-chart_id, so canvas edits flow into the template automatically.
-
-GET /api/v1/charts/edits?chart_id=...
-  returns the edit history for that chart (audit log: instruction + when).
+into another canvas.
 """
 from __future__ import annotations
 
 import logging
 
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from services import db_service
 from services.chart_edit import apply_chart_edit
+from services.canvas_export import render_canvas_pdf, _safe_filename
+from services.chart_excel import render_chart_xlsx
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["ChartEdits"])
@@ -116,6 +128,84 @@ def list_edits(
         "chart_id": chart_id,
         "edits":    db_service.get_chart_edit_history(chart_id, limit=limit),
     }
+
+
+def _load_owned_chart(chart_id: str, user_id: str) -> dict:
+    """Fetch a chart row (with reconstructed chart dict) and enforce
+    ownership. 404 if not found, 403 if the chart belongs to someone
+    else. Shared by the two per-chart download endpoints below."""
+    row = db_service.get_chart(chart_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Chart {chart_id} not found")
+    if row.get("user_id") != user_id:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Chart {chart_id} does not belong to user {user_id}",
+        )
+    return row
+
+
+@router.get(
+    "/charts/{chart_id}/download.pdf",
+    summary="Download a single chart as a PDF (ownership-checked)",
+    response_class=Response,
+)
+def download_chart_pdf(
+    chart_id: str,
+    user_id: str = Query(..., description="Owner — server verifies the chart belongs to this user"),
+):
+    """Renders ONE chart to a PDF using the same pipeline as canvas /
+    template downloads: matplotlib chart image, full-page sized, insight
+    callout underneath.
+
+    Returns the PDF bytes directly with a `Content-Disposition: attachment`
+    header so the browser downloads it.
+    """
+    row = _load_owned_chart(chart_id, user_id)
+    chart = row.get("chart") or {}
+    title = ((chart.get("title") or {}).get("text")
+             if isinstance(chart.get("title"), dict)
+             else (chart.get("title") or "Chart"))
+    # The PDF renderer operates on a `slots` list — wrap our single chart
+    # as a lone slot so we reuse the same code path.
+    pdf = render_canvas_pdf(title or "Chart", [{"chart": chart, "x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}])
+    fname = f"{_safe_filename(title or 'chart')}.pdf"
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+@router.get(
+    "/charts/{chart_id}/download.xlsx",
+    summary="Download a single chart's underlying data as an Excel file (ownership-checked)",
+    response_class=Response,
+)
+def download_chart_xlsx(
+    chart_id: str,
+    user_id: str = Query(..., description="Owner — server verifies the chart belongs to this user"),
+):
+    """Exports the chart's data as an .xlsx workbook with:
+      * `About` sheet — title, subtitle, description, insight.
+      * `Data`  sheet — table of the underlying values. Shape depends
+        on the chart type:
+          - cartesian → first column = x-axis category, then one column
+            per series (header = series name).
+          - pie / donut → three columns: `Name · Value · % of Total`.
+    """
+    row = _load_owned_chart(chart_id, user_id)
+    chart = row.get("chart") or {}
+    title = ((chart.get("title") or {}).get("text")
+             if isinstance(chart.get("title"), dict)
+             else (chart.get("title") or "Chart"))
+    xlsx = render_chart_xlsx(chart)
+    fname = f"{_safe_filename(title or 'chart')}.xlsx"
+    return Response(
+        content=xlsx,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
 
 
 # IMPORTANT: this catch-all path-param route MUST be registered last.

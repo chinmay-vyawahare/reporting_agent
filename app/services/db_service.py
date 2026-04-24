@@ -170,19 +170,22 @@ def ensure_tables() -> None:
             ON {_SCHEMA}.reporting_canvas_drafts (user_id, updated_at DESC);
     """
 
+    # A slot is just "this chart at this position". Coordinates are
+    # FREE-FORM fractions of the canvas viewport (0..1 for x/w, 0..N for
+    # y/h since the canvas can scroll). Stored as NUMERIC(10, 6) to keep
+    # ~6 decimal places of precision — plenty for pixel-accurate drag &
+    # drop while leaving room for arithmetic on the export side.
     create_canvas_slots = f"""
         CREATE TABLE IF NOT EXISTS {_SCHEMA}.reporting_canvas_slots (
-            slot_id         VARCHAR(100) PRIMARY KEY,
-            draft_id        VARCHAR(100) NOT NULL REFERENCES {_SCHEMA}.reporting_canvas_drafts(draft_id) ON DELETE CASCADE,
-            chart_id        VARCHAR(100) NOT NULL REFERENCES {_SCHEMA}.reporting_agent_charts(chart_id) ON DELETE CASCADE,
-            query_id        VARCHAR(100) NOT NULL,
-            original_query  TEXT,
-            x               SMALLINT     NOT NULL,
-            y               SMALLINT     NOT NULL,
-            w               SMALLINT     NOT NULL,
-            h               SMALLINT     NOT NULL,
-            position        SMALLINT     NOT NULL,
-            created_at      TIMESTAMP    NOT NULL DEFAULT NOW()
+            slot_id         VARCHAR(100)   PRIMARY KEY,
+            draft_id        VARCHAR(100)   NOT NULL REFERENCES {_SCHEMA}.reporting_canvas_drafts(draft_id) ON DELETE CASCADE,
+            chart_id        VARCHAR(100)   NOT NULL REFERENCES {_SCHEMA}.reporting_agent_charts(chart_id) ON DELETE CASCADE,
+            x               NUMERIC(10, 6) NOT NULL,
+            y               NUMERIC(10, 6) NOT NULL,
+            w               NUMERIC(10, 6) NOT NULL,
+            h               NUMERIC(10, 6) NOT NULL,
+            position        SMALLINT       NOT NULL,
+            created_at      TIMESTAMP      NOT NULL DEFAULT NOW()
         );
 
         CREATE INDEX IF NOT EXISTS idx_canvas_slots_draft
@@ -208,19 +211,19 @@ def ensure_tables() -> None:
             ON {_SCHEMA}.reporting_templates (source_draft_id);
     """
 
+    # Same shape as canvas slot — chart_id + free-form position.
+    # Provenance lives on the referenced chart row.
     create_template_selections = f"""
         CREATE TABLE IF NOT EXISTS {_SCHEMA}.reporting_template_selections (
-            selection_id    VARCHAR(100) PRIMARY KEY,
-            template_id     VARCHAR(100) NOT NULL REFERENCES {_SCHEMA}.reporting_templates(template_id) ON DELETE CASCADE,
-            chart_id        VARCHAR(100) NOT NULL REFERENCES {_SCHEMA}.reporting_agent_charts(chart_id) ON DELETE CASCADE,
-            query_id        VARCHAR(100) NOT NULL,
-            original_query  TEXT,
-            x               SMALLINT     NOT NULL,
-            y               SMALLINT     NOT NULL,
-            w               SMALLINT     NOT NULL,
-            h               SMALLINT     NOT NULL,
-            position        SMALLINT     NOT NULL,
-            created_at      TIMESTAMP    NOT NULL DEFAULT NOW()
+            selection_id    VARCHAR(100)   PRIMARY KEY,
+            template_id     VARCHAR(100)   NOT NULL REFERENCES {_SCHEMA}.reporting_templates(template_id) ON DELETE CASCADE,
+            chart_id        VARCHAR(100)   NOT NULL REFERENCES {_SCHEMA}.reporting_agent_charts(chart_id) ON DELETE CASCADE,
+            x               NUMERIC(10, 6) NOT NULL,
+            y               NUMERIC(10, 6) NOT NULL,
+            w               NUMERIC(10, 6) NOT NULL,
+            h               NUMERIC(10, 6) NOT NULL,
+            position        SMALLINT       NOT NULL,
+            created_at      TIMESTAMP      NOT NULL DEFAULT NOW()
         );
 
         CREATE INDEX IF NOT EXISTS idx_tmpl_selections_template
@@ -1008,10 +1011,15 @@ def _draft_meta(draft_id: str) -> dict | None:
 
 
 def list_canvas_slots(draft_id: str) -> list[dict]:
-    """Return slot rows for a draft, each with its chart fully reconstructed."""
+    """Return slot rows for a draft, each with its chart fully reconstructed.
+
+    x/y/w/h are NUMERIC in the DB (psycopg2 → Decimal); cast to float so
+    the JSON response is clean numbers the UI can do math on without an
+    extra decode step.
+    """
     rows = _fetch_rows(
         f"""
-        SELECT slot_id, draft_id, chart_id, query_id, original_query,
+        SELECT slot_id, draft_id, chart_id,
                x, y, w, h, position, created_at
         FROM {_SCHEMA}.reporting_canvas_slots
         WHERE draft_id = %s ORDER BY position ASC
@@ -1019,6 +1027,9 @@ def list_canvas_slots(draft_id: str) -> list[dict]:
         (draft_id,),
     )
     for r in rows:
+        for k in ("x", "y", "w", "h"):
+            if r.get(k) is not None:
+                r[k] = float(r[k])
         ch = get_chart(r["chart_id"])
         r["chart"] = ch.get("chart") if ch else {}
     return rows
@@ -1049,9 +1060,8 @@ def list_canvas_drafts(user_id: str, limit: int = 50) -> list[dict]:
 def replace_canvas_slots(draft_id: str, slot_specs: list[dict]) -> list[dict]:
     """Wipe all slots for a draft and insert the given list (one row each).
 
-    Each `slot_spec` carries:
-      slot_id (server-assigned if missing), chart_id, query_id, original_query,
-      x, y, w, h, position
+    Each `slot_spec` carries: slot_id (server-assigned if missing), chart_id,
+    x, y, w, h, position.
     Returns the freshly-saved slot list (with reconstructed charts).
     """
     import uuid as _uuid
@@ -1067,15 +1077,13 @@ def replace_canvas_slots(draft_id: str, slot_specs: list[dict]) -> list[dict]:
                     cur.execute(
                         f"""
                         INSERT INTO {_SCHEMA}.reporting_canvas_slots
-                            (slot_id, draft_id, chart_id, query_id, original_query,
-                             x, y, w, h, position)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            (slot_id, draft_id, chart_id, x, y, w, h, position)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                         (
                             sid, draft_id, s["chart_id"],
-                            s.get("query_id") or "",
-                            s.get("original_query") or "",
-                            int(s["x"]), int(s["y"]), int(s["w"]), int(s["h"]),
+                            float(s["x"]), float(s["y"]),
+                            float(s["w"]), float(s["h"]),
                             int(s["position"]),
                         ),
                     )
@@ -1163,9 +1171,11 @@ def bump_template_last_run(template_id: str) -> None:
 
 
 def list_template_selections(template_id: str) -> list[dict]:
+    """Selection rows + reconstructed chart per row. Same float-cast as
+    list_canvas_slots so the UI gets numbers, not Decimals."""
     rows = _fetch_rows(
         f"""
-        SELECT selection_id, template_id, chart_id, query_id, original_query,
+        SELECT selection_id, template_id, chart_id,
                x, y, w, h, position, created_at
         FROM {_SCHEMA}.reporting_template_selections
         WHERE template_id = %s ORDER BY position ASC
@@ -1173,6 +1183,9 @@ def list_template_selections(template_id: str) -> list[dict]:
         (template_id,),
     )
     for r in rows:
+        for k in ("x", "y", "w", "h"):
+            if r.get(k) is not None:
+                r[k] = float(r[k])
         ch = get_chart(r["chart_id"])
         r["chart"] = ch.get("chart") if ch else {}
     return rows
@@ -1207,7 +1220,11 @@ def get_templates_by_user(user_id: str, limit: int = 50) -> list[dict]:
 
 
 def replace_template_selections(template_id: str, selection_specs: list[dict]) -> list[dict]:
-    """Wipe all selections for a template and insert the given list."""
+    """Wipe all selections for a template and insert the given list.
+
+    Each `selection_spec` carries: selection_id (server-assigned if missing),
+    chart_id, x, y, w, h, position.
+    """
     import uuid as _uuid
     try:
         with _conn() as conn:
@@ -1221,15 +1238,13 @@ def replace_template_selections(template_id: str, selection_specs: list[dict]) -
                     cur.execute(
                         f"""
                         INSERT INTO {_SCHEMA}.reporting_template_selections
-                            (selection_id, template_id, chart_id, query_id, original_query,
-                             x, y, w, h, position)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            (selection_id, template_id, chart_id, x, y, w, h, position)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                         (
                             sid, template_id, s["chart_id"],
-                            s.get("query_id") or "",
-                            s.get("original_query") or "",
-                            int(s["x"]), int(s["y"]), int(s["w"]), int(s["h"]),
+                            float(s["x"]), float(s["y"]),
+                            float(s["w"]), float(s["h"]),
                             int(s["position"]),
                         ),
                     )
@@ -1257,9 +1272,7 @@ def sync_draft_to_template(draft_id: str) -> int:
         return 0
     slots = list_canvas_slots(draft_id)
     selection_specs = [{
-        "chart_id":       s["chart_id"],
-        "query_id":       s.get("query_id") or "",
-        "original_query": s.get("original_query") or "",
+        "chart_id": s["chart_id"],
         "x": s["x"], "y": s["y"], "w": s["w"], "h": s["h"], "position": s["position"],
     } for s in slots]
     n = 0

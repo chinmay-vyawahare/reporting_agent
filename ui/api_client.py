@@ -19,6 +19,7 @@ This replaces:
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
@@ -26,6 +27,8 @@ from typing import Any, Iterable
 
 import requests
 from pydantic import BaseModel, ValidationError
+
+logger = logging.getLogger(__name__)
 
 from models.chart_types import parse_chart
 from ui.models import (
@@ -247,7 +250,24 @@ class ApiClient:
 
     @staticmethod
     def _parse_list(model: type[BaseModel], items: Iterable[Any]) -> list[Any]:
-        return [ApiClient._parse(model, i) for i in items or []]
+        """Parse a list of items into the given model.
+
+        Per-item tolerant: if one item fails validation, it is logged and
+        skipped instead of aborting the whole list. Reason: in the UI, a
+        single malformed row (e.g., a chart saved under an older shape)
+        should not blank out the user's entire thread / canvas / template
+        list. The bad row gets dropped, the rest of the list renders.
+        """
+        out: list[Any] = []
+        for i, item in enumerate(items or []):
+            try:
+                out.append(model.model_validate(item))
+            except ValidationError as e:
+                logger.warning(
+                    "skipped %s[%d] — did not match schema: %s",
+                    model.__name__, i, e.errors()[:2],
+                )
+        return out
 
     # ────────────────────────────────────────────────────────────────────
     # Threads
@@ -256,9 +276,18 @@ class ApiClient:
         body = self._request("GET", "/threads", params={"user_id": user_id, "limit": limit})
         return self._parse_list(Thread, body.get("threads", []))
 
-    def list_thread_queries(self, thread_id: str, limit: int = 100) -> list[Query]:
-        body = self._request("GET", f"/threads/{thread_id}/queries", params={"limit": limit})
-        return self._parse_list(Query, body.get("queries", []))
+    def list_thread_messages(self, thread_id: str, user_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        """Chat-style messages for a thread — alternating user/ai entries.
+
+        Ownership-checked: server returns 403 if the thread doesn't belong
+        to user_id. Each message is `{role, query_id, content, ...}` — see
+        the threads endpoint docstring for the per-role shape.
+        """
+        body = self._request(
+            "GET", f"/threads/{thread_id}/messages",
+            params={"user_id": user_id, "limit": limit},
+        )
+        return body.get("messages", []) or []
 
     # ────────────────────────────────────────────────────────────────────
     # Charts
@@ -349,49 +378,47 @@ class ApiClient:
     # ────────────────────────────────────────────────────────────────────
     # Templates
     # ────────────────────────────────────────────────────────────────────
-    def list_templates(self, user_id: str, limit: int = 50) -> list[Template]:
-        """Metadata-only list (selections are NOT inlined). Call get_template()
-        to fetch a single template with its selections + reconstructed charts."""
-        body = self._request("GET", "/templates", params={"user_id": user_id, "limit": limit})
-        return self._parse_list(Template, body.get("templates", []))
+    def list_templates(self, user_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        """Lightweight list — each row is just `{template_id, title}`.
 
-    def get_template(self, template_id: str) -> Template:
-        """Single template with selections + reconstructed chart per selection."""
-        body = self._request("GET", f"/templates/{template_id}")
+        Open a single template via `get_template(template_id, user_id=...)`
+        to fetch its full state (selections + reconstructed charts).
+        """
+        body = self._request("GET", "/templates", params={"user_id": user_id, "limit": limit})
+        return body.get("templates", []) or []
+
+    def get_template(self, template_id: str, user_id: str) -> Template:
+        """Single template with selections + reconstructed chart per selection.
+
+        `user_id` is required — server enforces ownership and returns 403
+        if the template doesn't belong to that user.
+        """
+        body = self._request(
+            "GET", f"/templates/{template_id}",
+            params={"user_id": user_id},
+        )
         return self._parse(Template, body)
 
     def upsert_template(
         self,
         *,
         user_id: str,
-        title: str,
-        project_type: str = "",
-        source_draft_id: str | None = None,
-        selections: list[dict[str, Any]],
+        draft_id: str,
+        title: str | None = None,
+        project_type: str | None = None,
     ) -> TemplateActionResponse:
-        # Same up-front per-chart validation as patch_draft.
-        for i, s in enumerate(selections):
-            ch = s.get("chart")
-            if ch is None:
-                raise ApiError(
-                    status=400, method="POST", path="/templates",
-                    detail=f"selections[{i}].chart is required", raw="",
-                )
-            try:
-                parse_chart(ch)
-            except (ValueError, ValidationError) as e:
-                raise ApiError(
-                    status=422, method="POST", path="/templates",
-                    detail=f"selections[{i}].chart failed strict schema: {e}", raw="",
-                )
+        """Save a canvas as a template — by reference, no chart payload sent.
+
+        Server pulls the slots from the draft, copies them as the template's
+        selections (chart_id reference), and upserts by draft_id.
+        """
         body = self._request(
             "POST", "/templates",
             json_body={
-                "user_id":         user_id,
-                "title":           title,
-                "project_type":    project_type,
-                "source_draft_id": source_draft_id,
-                "selections":      selections,
+                "user_id":      user_id,
+                "draft_id":     draft_id,
+                "title":        title,
+                "project_type": project_type,
             },
             timeout=30,
         )

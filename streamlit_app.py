@@ -468,11 +468,31 @@ def api_delete_draft(draft_id: str) -> bool:
         return False
 
 
-def api_list_thread_queries(thread_id: str) -> list[dict]:
+def api_list_thread_messages(thread_id: str, user_id: str) -> list[dict]:
+    """Server enforces ownership — pass the current user_id."""
     try:
-        return [q.model_dump() for q in api.list_thread_queries(thread_id)]
+        return api.list_thread_messages(thread_id, user_id=user_id)
     except (ApiError, requests.RequestException):
         return []
+
+
+def _messages_to_query_records(messages: list[dict]) -> list[dict]:
+    """Pair the flat user/ai message stream back into per-turn records the
+    chat renderer expects. Same `query_id` pairs them; user.content → query
+    text, ai.content → rationale, ai.charts → charts."""
+    by_qid: dict[str, dict] = {}
+    order: list[str] = []
+    for m in messages:
+        qid = m.get("query_id") or ""
+        if qid not in by_qid:
+            by_qid[qid] = {"query_id": qid, "query": "", "rationale": "", "charts": []}
+            order.append(qid)
+        if m.get("role") == "user":
+            by_qid[qid]["query"] = m.get("content") or ""
+        elif m.get("role") == "ai":
+            by_qid[qid]["rationale"] = m.get("content") or ""
+            by_qid[qid]["charts"] = m.get("charts") or []
+    return [by_qid[q] for q in order]
 
 
 # ── Page setup ──────────────────────────────────────────────────────────────
@@ -510,11 +530,20 @@ def _list_threads_for_user(uid: str) -> list[dict]:
         return []
 
 
-def _list_queries_in_thread(tid: str) -> list[dict]:
+def _list_queries_in_thread(tid: str, uid: str) -> list[dict]:
+    """Sidebar Q list for an inactive thread. Pulls the chat messages and
+    keeps just the user-side entries (the questions). Ownership-checked."""
     try:
-        return [q.model_dump() for q in api.list_thread_queries(tid)]
+        msgs = api.list_thread_messages(tid, user_id=uid)
     except (ApiError, requests.RequestException):
         return []
+    # Sidebar only needs each user question — flatten ai messages out.
+    return [
+        {"query_id": m.get("query_id"),
+         "original_query": m.get("content") or "",
+         "rationale": ""}
+        for m in msgs if m.get("role") == "user"
+    ]
 
 
 with st.sidebar:
@@ -549,7 +578,7 @@ with st.sidebar:
             # shows up in the sidebar without a manual refresh.
             cache_key = f"_thread_qs_{tid}"
             if is_active or cache_key not in st.session_state:
-                st.session_state[cache_key] = _list_queries_in_thread(tid)
+                st.session_state[cache_key] = _list_queries_in_thread(tid, user_id)
             qs = st.session_state[cache_key]
 
             label = f"{'🟢' if is_active else '💬'}  {title[:48]}"
@@ -590,39 +619,23 @@ with st.sidebar:
 
 # ── Rehydrate chat from the DB ──────────────────────────────────────────────
 
-def _fetch_charts_for_query(query_id: str) -> list[dict]:
-    """Return the chart objects (NOT the row wrappers) for a query.
-
-    `/charts?query_id=` returns rows of the form
-        { chart_id, query_id, user_id, …, chart: {…actual chart…} }
-    where the row's `chart` field is the API-shaped chart dict (the same
-    shape /report/stream emits). The rest of the UI deals in chart dicts
-    (canvas slot validation, edits, render), so we unwrap to the inner
-    `chart` here — keeping a single in-memory shape across the app.
-    """
-    try:
-        # api.list_charts_by_query returns typed ChartRow objects; the inner
-        # `.chart` is the validated Chart object the rest of the UI uses.
-        return [row.chart.model_dump() for row in api.list_charts_by_query(query_id)]
-    except (ApiError, requests.RequestException):
-        return []
-
-
 if not st.session_state.queries:
-    server_rows = api_list_thread_queries(st.session_state.thread_id)
+    # Pull the thread as a chat-style message list (user/ai pairs).
+    # Re-pair the messages back into per-turn records the renderer expects:
+    # one record per query_id with {query, rationale, charts}.
+    messages = api_list_thread_messages(st.session_state.thread_id, user_id)
+    paired = _messages_to_query_records(messages)
     rebuilt = []
-    for row in server_rows:
-        # Charts no longer live on the queries row — fetch them from the
-        # dedicated reporting_agent_charts table via /charts?query_id=.
+    for row in paired:
         qid = row.get("query_id") or str(uuid.uuid4())
         rebuilt.append({
             "query_id":           qid,
-            "query":              row.get("original_query") or "",
-            "project_type":       row.get("project_type") or "",
-            "charts":             _fetch_charts_for_query(qid),
+            "query":              row.get("query") or "",
+            "project_type":       "",
+            "charts":             row.get("charts") or [],
             "rationale":          row.get("rationale") or "",
-            "traversal_steps":    row.get("traversal_steps") or 0,
-            "traversal_findings": row.get("traversal_findings") or "",
+            "traversal_steps":    0,
+            "traversal_findings": "",
             "retrieval_nodes":    [],
             "retrieval_paths":    [],
         })
@@ -679,13 +692,12 @@ def _add_chart_to_draft(draft: dict, q_rec: dict, chart_idx: int):
     if len(slots) >= MAX_REPORT_CHARTS:
         return False, f"Draft is full ({MAX_REPORT_CHARTS} max)."
 
-    # CanvasSlot is now: query_id + chart (with chart.script inside) + layout.
-    # The slot-level `script` duplicate was dropped — script lives in chart.
+    # CanvasSlot is just: chart + position. Provenance (query_id,
+    # original_query) lives on the chart row server-side — no need to
+    # repeat it here.
     slots.append({
-        "position":       len(slots),
-        "query_id":       q_rec["query_id"],
-        "original_query": q_rec.get("query", ""),
-        "chart":          chart,
+        "position": len(slots),
+        "chart":    chart,
     })
     resp = api_patch_draft(draft["draft_id"], slots=slots)
     return resp is not None, "Added."
@@ -752,7 +764,7 @@ def _edit_chart_dialog(chart_id: str, chart_title: str):
         try:
             with st.spinner("Patching the chart config..."):
                 edit = api.edit_chart(chart_id, instruction.strip())
-            patched = edit.chart.model_dump()
+            patched = edit.chart  # plain dict on read
             _sync_chart_everywhere_in_session(chart_id, patched)
             st.success("Edit applied and saved.")
             st.rerun()
@@ -970,7 +982,7 @@ with col_chat:
         with st.container(border=True):
             st.markdown(f"**You:** {q_rec['query']}")
             if q_rec.get("rationale"):
-                st.info(f"**Insight:** {q_rec['rationale']}")
+                st.info(f"**AI:** {q_rec['rationale']}")
             charts = q_rec.get("charts") or []
             if not charts:
                 st.warning("No charts were produced for this query.")
@@ -996,20 +1008,19 @@ with col_chat:
 # ── RIGHT: Canvas + Templates tabs ──────────────────────────────────────────
 
 with col_canvas:
-    # Pull templates with their selections inlined.
-    # The list endpoint is metadata-only (cheap), so per-template
-    # selections are hydrated via get_template() — same pattern as
-    # api_list_drafts. Sub-millisecond per call thanks to the pool.
+    # The list endpoint returns just {template_id, title} per row.
+    # Each template card we want to display is hydrated via
+    # GET /templates/{id}?user_id=... (ownership-checked, full state).
     try:
-        _meta_tpls = api.list_templates(user_id)
+        _meta_tpls = api.list_templates(user_id)   # list[dict] — id+title
         templates_for_right = []
         for t in _meta_tpls:
+            tid = t["template_id"]
             try:
-                templates_for_right.append(api.get_template(t.template_id).model_dump())
+                templates_for_right.append(api.get_template(tid, user_id=user_id).model_dump())
             except (ApiError, requests.RequestException):
-                # Fall back to metadata-only on a per-template hiccup so
-                # the rest of the list still renders.
-                templates_for_right.append({**t.model_dump(), "selections": []})
+                # Fall back to id+title only so the rest of the list still renders.
+                templates_for_right.append({**t, "selections": []})
     except (ApiError, requests.RequestException):
         templates_for_right = []
 
@@ -1263,40 +1274,16 @@ with tab_canvas_pane:
                 disabled=not slots,
             )
         if finalize:
-            # `slots` is already sorted by .position from the drag-drop handler.
-            # `source_draft_id` links the finalized template back to this
-            # canvas so later layout changes propagate automatically.
-            # Templates are user-scoped, not thread-scoped (canvas can mix
-            # charts from any thread). Only send source_draft_id so the
-            # server can upsert by draft.
-            payload = {
-                "user_id":         user_id,
-                "title":           ftitle,
-                "project_type":    project_type,
-                "source_draft_id": active_draft["draft_id"],
-                "selections": [
-                    {
-                        # TemplateSelectionIn = query_id + chart + layout.
-                        # `chart.script` lives inside chart and is required.
-                        "position":       s.get("position", i),
-                        "x":              s.get("x"),
-                        "y":              s.get("y"),
-                        "w":              s.get("w"),
-                        "h":              s.get("h"),
-                        "query_id":       s["query_id"],
-                        "chart":          s["chart"],
-                        "original_query": s.get("original_query", ""),
-                    } for i, s in enumerate(slots)
-                ],
-            }
+            # New API: just send {user_id, draft_id, title, project_type}.
+            # The server pulls slots from the draft and copies them as the
+            # template's selections by chart_id reference — no chart payload
+            # duplication.
             try:
-                clean = _sanitize_for_json(payload)
                 action_resp = api.upsert_template(
-                    user_id=clean["user_id"],
-                    title=clean["title"],
-                    project_type=clean.get("project_type", ""),
-                    source_draft_id=clean.get("source_draft_id"),
-                    selections=clean["selections"],
+                    user_id=user_id,
+                    draft_id=active_draft["draft_id"],
+                    title=ftitle,
+                    project_type=project_type,
                 )
                 st.success(
                     f"Template **{action_resp.action}**. Open the **📄 Templates** tab to view it."

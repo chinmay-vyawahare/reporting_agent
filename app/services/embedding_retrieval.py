@@ -227,8 +227,8 @@ def _summarize_hydrated(hydrated: dict[str, dict[str, Any]], paths: list[dict[st
 
 def retrieve_context(
     query: str,
-    top_k_nodes: int = 8,
-    top_k_paths: int = 6,
+    top_k_nodes: int = 4,
+    top_k_paths: int = 4,
     min_score: float = 0.40,
 ) -> dict[str, Any]:
     """

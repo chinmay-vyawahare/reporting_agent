@@ -1,0 +1,124 @@
+Cartesian — chart.type = "column" (side-by-side bars)
+
+{ "chart": { "type": "column" } }
+{ "chart": { "type": "bar" } }
+{ "chart": { "type": "line" } }
+{ "chart": { "type": "spline" } }
+{ "chart": { "type": "area" } }
+{ "chart": { "type": "areaspline" } }
+{ "chart": { "type": "scatter" } }
+
+
+{
+  "slots": [
+    {
+      "x": 0.0, "y": 0.0, "w": 0.5, "h": 0.5,
+      "chart": {
+        "chart_id": "0c7e9b4a-c3d6-4d2c-9c8a-7b1d5d8f9e10",
+        "chart": { "type": "column" },
+        "colors": ["#2E86AB", "#F18F01", "#A23B72", "#3B8EA5", "#C73E1D", "#6A994E"],
+        "title": { "text": "Weekly GC Run Rate by Region" },
+        "subtitle": { "text": "NTM Projects, Last 12 Weeks" },
+        "xAxis": { "categories": ["CENTRAL", "NORTHEAST", "SOUTH", "WEST"], "title": { "text": "Region" } },
+        "yAxis": { "title": { "text": "Sites / week" } },
+        "series": [{ "name": "Run rate", "data": [0.25, 0.08, 0.08, 0.12] }],
+        "legend":  { "enabled": true },
+        "tooltip": { "valueSuffix": " sites/week" },
+        "plotOptions": { "column": { "dataLabels": { "enabled": true, "format": "{y}" } } },
+        "description": "Central region leads at 0.25 sites/week.",
+        "insight": "Central leads with 0.25 sites/week, 3x the 0.08 rate of Northeast and South. Run rate has held steady for the trailing 12-week window.",
+        "script": "sql = 'SELECT rgn_region, COUNT(*) FROM ...'\nresult = run_sql(sql)",
+        "sql_index": 1
+      }
+    }
+  ]
+}
+
+Pie — chart.type = "pie" (slice distribution)
+
+{ "chart": { "type": "pie" } }
+{ "chart": { "type": "donut" } }
+
+{
+  "slots": [
+    {
+      "x": 0.5, "y": 0.0, "w": 0.5, "h": 0.5,
+      "chart": {
+        "chart_id": "1f4f9a2b-1a2c-4d5e-8f6a-9b0c1d2e3f40",
+        "chart": { "type": "pie" },
+        "colors": ["#2E86AB", "#F18F01", "#A23B72", "#3B8EA5"],
+        "title": { "text": "Pending Sites by Region" },
+        "subtitle": { "text": "NTM, snapshot 2026-04-24" },
+        "series": [{
+          "name": "Pending sites",
+          "data": [
+            { "name": "CENTRAL",   "y": 46 },
+            { "name": "SOUTH",     "y": 29 },
+            { "name": "NORTHEAST", "y": 25 },
+            { "name": "WEST",      "y": 18 }
+          ]
+        }],
+        "legend":  { "enabled": true },
+        "tooltip": { "pointFormat": "{point.name}: <b>{point.y}</b>" },
+        "plotOptions": { "pie": { "dataLabels": { "enabled": true, "format": "{point.name}: {point.percentage:.1f}%" } } },
+        "description": "Central holds 39% of pending sites.",
+        "insight": "Central accounts for ~39% of pending sites, followed by South (24%) and Northeast (21%). The skew toward Central suggests a regional bottleneck worth resourcing.",
+        "script": "sql = 'SELECT rgn_region, COUNT(*) FROM ...'\nresult = run_sql(sql)",
+        "sql_index": 1
+      }
+    }
+  ]
+}
+
+Or — both in one PATCH (cartesian left, pie right, side-by-side)
+
+{
+  "slots": [
+    {
+      "x": 0.0, "y": 0.0, "w": 0.5, "h": 0.5,
+      "chart": {
+        "chart_id": "0c7e9b4a-c3d6-4d2c-9c8a-7b1d5d8f9e10",
+        "chart": { "type": "column" },
+        "colors": ["#2E86AB", "#F18F01", "#A23B72", "#3B8EA5", "#C73E1D", "#6A994E"],
+        "title": { "text": "Weekly GC Run Rate by Region" },
+        "subtitle": { "text": "NTM Projects, Last 12 Weeks" },
+        "xAxis": { "categories": ["CENTRAL", "NORTHEAST", "SOUTH", "WEST"], "title": { "text": "Region" } },
+        "yAxis": { "title": { "text": "Sites / week" } },
+        "series": [{ "name": "Run rate", "data": [0.25, 0.08, 0.08, 0.12] }],
+        "legend":  { "enabled": true },
+        "tooltip": { "valueSuffix": " sites/week" },
+        "plotOptions": { "column": { "dataLabels": { "enabled": true, "format": "{y}" } } },
+        "description": "Central region leads at 0.25 sites/week.",
+        "insight": "Central leads with 0.25 sites/week, 3x the 0.08 rate of Northeast and South. Run rate has held steady for the trailing 12-week window.",
+        "script": "sql = 'SELECT rgn_region, COUNT(*) FROM ...'\nresult = run_sql(sql)",
+        "sql_index": 1
+      }
+    },
+    {
+      "x": 0.5, "y": 0.0, "w": 0.5, "h": 0.5,
+      "chart": {
+        "chart_id": "1f4f9a2b-1a2c-4d5e-8f6a-9b0c1d2e3f40",
+        "chart": { "type": "pie" },
+        "colors": ["#2E86AB", "#F18F01", "#A23B72", "#3B8EA5"],
+        "title": { "text": "Pending Sites by Region" },
+        "subtitle": { "text": "NTM, snapshot 2026-04-24" },
+        "series": [{
+          "name": "Pending sites",
+          "data": [
+            { "name": "CENTRAL",   "y": 46 },
+            { "name": "SOUTH",     "y": 29 },
+            { "name": "NORTHEAST", "y": 25 },
+            { "name": "WEST",      "y": 18 }
+          ]
+        }],
+        "legend":  { "enabled": true },
+        "tooltip": { "pointFormat": "{point.name}: <b>{point.y}</b>" },
+        "plotOptions": { "pie": { "dataLabels": { "enabled": true, "format": "{point.name}: {point.percentage:.1f}%" } } },
+        "description": "Central holds 39% of pending sites.",
+        "insight": "Central accounts for ~39% of pending sites, followed by South (24%) and Northeast (21%). The skew toward Central suggests a regional bottleneck worth resourcing.",
+        "script": "sql = 'SELECT rgn_region, COUNT(*) FROM ...'\nresult = run_sql(sql)",
+        "sql_index": 1
+      }
+    }
+  ]
+}

@@ -74,7 +74,7 @@ or wrong nesting → 422.
     ],
     "legend":      {{{{ "enabled": true }}}},                 // optional
     "tooltip":     {{{{ "valueSuffix": " units" }}}},         // optional
-    "plotOptions": {{{{ "column": {{{{ "dataLabels": {{{{ "enabled": true }}}} }}}} }}}},   // optional
+    "plotOptions": {{{{ "column": {{{{ "dataLabels": {{{{ "enabled": true, "format": "{{{{y}}}}" }}}} }}}} }}}},   // REQUIRED — dataLabels.enabled=true; see rule 17
     "description": "One-sentence takeaway",             // REQUIRED string
     "insight":     "2-3 line plain string"              // REQUIRED non-empty
 }}}}
@@ -94,7 +94,7 @@ or wrong nesting → 422.
     }}}}],
     "legend":      {{{{ "enabled": true }}}},
     "tooltip":     {{{{ "valueSuffix": " units" }}}},
-    "plotOptions": {{{{ "pie": {{{{ "dataLabels": {{{{ "enabled": true, "format": "{{{{point.name}}}}: {{{{point.percentage:.1f}}}}%" }}}} }}}} }}}},
+    "plotOptions": {{{{ "pie": {{{{ "dataLabels": {{{{ "enabled": true, "format": "{{{{point.name}}}}: {{{{point.percentage:.1f}}}}%" }}}} }}}} }}}},   // REQUIRED — see rule 17
     "description": "One-sentence takeaway",
     "insight":     "2-3 line plain string"
 }}}}
@@ -139,6 +139,19 @@ the primary one. The server uses this to wire the chart back to its script.
     Examples: `2.23` not `2.3333333333`; `87.5` not `87.5000`; integers stay integers (`42` not `42.00`).
 16. COLORS — every chart MUST set the top-level `colors` array to the exact palette above. Do NOT
     invent hex codes. Color overrides happen later via the chart-edit API.
+17. DATA LABELS ARE MANDATORY — every chart MUST set `plotOptions.<type>.dataLabels.enabled = true`
+    so the numeric value is printed directly on the bar / point / slice. The PDF export has no
+    hover, so values that only live in `tooltip` are invisible there.
+      * Column / bar / line / area / spline / areaspline / scatter:
+          `"plotOptions": {{{{ "<type>": {{{{ "dataLabels": {{{{ "enabled": true, "format": "{{{{y}}}}" }}}} }}}} }}}}`
+      * Pie / donut:
+          `"plotOptions": {{{{ "pie": {{{{ "dataLabels": {{{{ "enabled": true, "format": "{{{{point.name}}}}: {{{{point.percentage:.1f}}}}%" }}}} }}}} }}}}`
+    Leaving dataLabels disabled (or omitting plotOptions for the chart type) will not be rejected
+    by validation, but the chart WILL be unreadable in the PDF — always include it.
+18. CATEGORY CAP — cartesian charts MUST NOT exceed **15 categories** on the x-axis. If the raw
+    data has more, collapse the tail into a single `"Others"` bucket or pick a different breakdown
+    (e.g. Top 10 + Others). A chart with 70 identical 1-tall bars is not insightful — the point of
+    the agent is to surface the story, not dump rows.
 """
 
 GRAPH_AGENT_USER = """# User Question
