@@ -1,14 +1,15 @@
 """
-Streamlit UI for the Reporting Agent.
+Streamlit UI for the Reporting Agent — single-file, self-contained.
 
-Layout:
-  - LEFT  (60%): chat thread. Ask a question, get charts, edit charts, add
-                 charts to the active canvas draft.
-  - RIGHT (40%): canvas box — the active report draft. Drag-drop reorder,
-                 rename, finalize to a template. DB-backed (no session state
-                 for canvas state), so a browser refresh does not wipe it.
-  - Sidebar:    user settings, draft picker, saved templates.
-  - Saved template view is a collapsible bottom section.
+Talks to every API endpoint the FastAPI backend exposes. Use it to:
+  • ask questions and watch the SSE stream
+  • browse threads + their chat-style message history
+  • build canvas drafts (free-form drag/drop)
+  • save canvases as templates, re-run them, download as HTML/PDF
+  • inspect every API response in a "Last response" expander per call
+
+There is NO separate `ui/` package — everything (HTTP helpers, view-model
+shaping, rendering) lives in this file so the app is easy to read end-to-end.
 
 Run: streamlit run streamlit_app.py
 """
@@ -16,34 +17,15 @@ from __future__ import annotations
 
 import json
 import math
-import sys
+import time
 import urllib.parse
 import uuid
 from pathlib import Path
-
-_APP_DIR = str(Path(__file__).resolve().parent / "app")
-if _APP_DIR not in sys.path:
-    sys.path.insert(0, _APP_DIR)
-
-from dotenv import load_dotenv
-load_dotenv(Path(__file__).resolve().parent / ".env")
+from typing import Any
 
 import requests
-import streamlit as st  # type: ignore[import-unresolved]
-import streamlit.components.v1 as components  # type: ignore[import-unresolved]
-
-# Typed API client — single source of truth for talking to the backend.
-# Replaces the scattered `requests.*` calls and the requests-monkey-patch
-# trace. The client owns: serialisation, response parsing into Pydantic
-# models, structured ApiError, and a per-call trace ring for debugging.
-from ui.api_client import ApiClient, ApiError
-
-try:
-    from streamlit_sortables import sort_items  # type: ignore[import-unresolved]
-    _HAVE_SORTABLE = True
-except Exception:
-    _HAVE_SORTABLE = False
-
+import streamlit as st  # type: ignore
+import streamlit.components.v1 as components  # type: ignore
 
 # ── Configuration ───────────────────────────────────────────────────────────
 
@@ -52,1445 +34,1081 @@ PROJECT_TYPES = ["NTM", "AHLOB Modernization", "Both"]
 MAX_REPORT_CHARTS = 6
 
 
-def get_client() -> ApiClient:
-    """Fresh ApiClient per rerun — but its trace + HTTP session are
-    module-level singletons inside `ui.api_client`, so they persist
-    across reruns. We deliberately DON'T `@st.cache_resource` the
-    instance: caching pinned the methods table from the moment the
-    cache was warmed, so adding a new client method (`get_template`)
-    needed a process restart to become visible. Re-instantiating each
-    time is sub-microsecond and lets new methods land on hot reload.
+# ── HTTP helpers (no ApiClient class — just functions) ─────────────────────
+
+# A persistent Session keeps TCP connections warm across reruns.
+@st.cache_resource
+def _session() -> requests.Session:
+    return requests.Session()
+
+
+def _request(method: str, path: str, *, params=None, json_body=None, timeout=15.0) -> tuple[int, Any, str | None]:
+    """Single API call. Returns (status, body_or_dict, error_msg).
+
+    On success: returns (200..299, parsed JSON dict/list, None).
+    On API error: returns (status, parsed_or_text, short_error_msg).
+    On network error: returns (0, None, error_msg).
     """
-    return ApiClient(API_BASE)
+    url = f"{API_BASE}{path}"
+    try:
+        r = _session().request(method, url, params=params, json=json_body, timeout=timeout)
+    except requests.RequestException as e:
+        _record_call(method, path, params, json_body, status="ERR", elapsed_ms=0, body=None, error=str(e))
+        return 0, None, f"network: {e}"
+
+    elapsed = r.elapsed.total_seconds() * 1000
+    body: Any = None
+    try:
+        body = r.json() if r.content else None
+    except Exception:
+        body = r.text
+
+    _record_call(method, path, params, json_body, status=r.status_code, elapsed_ms=elapsed, body=body, error=None)
+
+    if 200 <= r.status_code < 300:
+        return r.status_code, body, None
+    err = f"HTTP {r.status_code}"
+    if isinstance(body, dict):
+        d = body.get("detail")
+        if isinstance(d, str):
+            err += f" — {d}"
+        elif isinstance(d, list) and d and isinstance(d[0], dict):
+            loc = ".".join(str(x) for x in (d[0].get("loc") or []))
+            err += f" — {loc}: {d[0].get('msg')}"
+    return r.status_code, body, err
 
 
-api = get_client()
+def _record_call(method, path, params, json_body, *, status, elapsed_ms, body, error):
+    """Append the call to the in-memory trace ring shown in the debug pane."""
+    if "_api_trace" not in st.session_state:
+        st.session_state._api_trace = []
+    st.session_state._api_trace.insert(0, {
+        "ts":          time.strftime("%H:%M:%S"),
+        "method":      method.upper(),
+        "path":        path,
+        "params":      params,
+        "request":     json_body,
+        "status":      status,
+        "elapsed_ms":  round(elapsed_ms, 1),
+        "response":    body,
+        "error":       error,
+    })
+    del st.session_state._api_trace[200:]
 
 
-# ── JSON sanitizer (NaN/Inf → null) ─────────────────────────────────────────
+# Typed wrappers (one per endpoint) — every response from the server passes
+# through one of these so there's a single audit point.
 
-def _sanitize_for_json(obj):
-    if obj is None:
-        return None
+def api_health() -> tuple[int, Any, str | None]:
+    return _request("GET", "/health/")
+
+# Threads
+def api_list_threads(user_id: str, limit: int = 50):
+    return _request("GET", "/threads", params={"user_id": user_id, "limit": limit})
+
+def api_thread_messages(thread_id: str, user_id: str, limit: int = 100):
+    return _request("GET", f"/threads/{thread_id}/messages",
+                    params={"user_id": user_id, "limit": limit})
+
+# Charts
+def api_chart(chart_id: str):
+    return _request("GET", f"/charts/{chart_id}")
+
+def api_charts_by_query(query_id: str):
+    return _request("GET", "/charts", params={"query_id": query_id})
+
+def api_charts_by_user(user_id: str, limit: int = 100):
+    return _request("GET", "/charts", params={"user_id": user_id, "limit": limit})
+
+def api_charts_by_thread(thread_id: str, limit: int = 100):
+    return _request("GET", "/charts", params={"thread_id": thread_id, "limit": limit})
+
+def api_chart_edit(chart_id: str, instruction: str):
+    return _request("POST", "/charts/edit",
+                    json_body={"chart_id": chart_id, "instruction": instruction},
+                    timeout=120)
+
+def api_chart_edit_history(chart_id: str, limit: int = 20):
+    return _request("GET", "/charts/edits", params={"chart_id": chart_id, "limit": limit})
+
+# Canvas
+def api_list_drafts(user_id: str, limit: int = 50):
+    return _request("GET", "/canvas/drafts", params={"user_id": user_id, "limit": limit})
+
+def api_get_draft(draft_id: str):
+    return _request("GET", f"/canvas/drafts/{draft_id}")
+
+def api_create_draft(user_id: str, name: str, project_type: str = ""):
+    return _request("POST", "/canvas/drafts",
+                    json_body={"user_id": user_id, "name": name, "project_type": project_type})
+
+def api_patch_draft(draft_id: str, *, name: str | None = None, slots: list | None = None):
+    body: dict[str, Any] = {}
+    if name is not None:  body["name"] = name
+    if slots is not None: body["slots"] = slots
+    return _request("PATCH", f"/canvas/drafts/{draft_id}", json_body=body, timeout=30)
+
+def api_delete_draft(draft_id: str):
+    return _request("DELETE", f"/canvas/drafts/{draft_id}")
+
+# Templates
+def api_list_templates(user_id: str, limit: int = 50):
+    return _request("GET", "/templates", params={"user_id": user_id, "limit": limit})
+
+def api_get_template(template_id: str, user_id: str):
+    return _request("GET", f"/templates/{template_id}", params={"user_id": user_id})
+
+def api_create_template(user_id: str, draft_id: str,
+                        title: str | None = None, project_type: str | None = None):
+    return _request("POST", "/templates",
+                    json_body={"user_id": user_id, "draft_id": draft_id,
+                               "title": title, "project_type": project_type},
+                    timeout=30)
+
+def api_run_template(template_id: str):
+    return _request("POST", f"/templates/{template_id}/run", json_body={}, timeout=600)
+
+def api_delete_template(template_id: str):
+    return _request("DELETE", f"/templates/{template_id}")
+
+
+# ── Highcharts rendering (load JS once) ─────────────────────────────────────
+
+_HIGHCHARTS_JS_PATH = Path(__file__).resolve().parent / "static" / "highcharts.js"
+_HIGHCHARTS_JS = _HIGHCHARTS_JS_PATH.read_text(encoding="utf-8") if _HIGHCHARTS_JS_PATH.exists() else ""
+
+
+def _sanitize(obj):
+    """Replace NaN / Inf with None so the chart payload is valid JSON."""
+    if obj is None: return None
     if isinstance(obj, float):
-        if math.isnan(obj) or math.isinf(obj):
-            return None
+        if math.isnan(obj) or math.isinf(obj): return None
         return obj
-    if isinstance(obj, dict):
-        return {(k if isinstance(k, str) else str(k)): _sanitize_for_json(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_sanitize_for_json(v) for v in obj]
+    if isinstance(obj, dict):  return {k: _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)): return [_sanitize(v) for v in obj]
     return obj
 
 
-# ── Highcharts rendering ────────────────────────────────────────────────────
-
-_HIGHCHARTS_JS_PATH = Path(__file__).resolve().parent / "static" / "highcharts.js"
-_HIGHCHARTS_JS = ""
-if _HIGHCHARTS_JS_PATH.exists():
-    _HIGHCHARTS_JS = _HIGHCHARTS_JS_PATH.read_text(encoding="utf-8")
-
-
-def render_insight(insight, header: str = "💡 Insight"):
-    if not insight:
-        return
-    st.markdown(f"##### {header}")
-    if isinstance(insight, dict):
-        headline = (insight.get("headline") or "").strip()
-        what = insight.get("what_the_data_shows") or []
-        why = insight.get("why_it_matters") or []
-        nxt = (insight.get("recommended_next_step") or "").strip()
-        legacy_md = insight.get("_legacy_markdown") or ""
-        if headline:
-            st.markdown(
-                f"<div style='padding:8px 12px;border-left:4px solid #4CAF50;"
-                f"background:rgba(76,175,80,0.08);margin-bottom:8px;"
-                f"font-size:1.02em;'><b>{headline}</b></div>",
-                unsafe_allow_html=True,
-            )
-        if what:
-            st.markdown("**What the data shows**")
-            for b in what:
-                st.markdown(f"- {b}")
-        if why:
-            st.markdown("**Why it matters**")
-            for b in why:
-                st.markdown(f"- {b}")
-        if nxt:
-            st.markdown("**Recommended next step**")
-            st.markdown(f"- {nxt}")
-        if legacy_md and not (headline or what or why or nxt):
-            st.markdown(legacy_md)
-        return
-    if isinstance(insight, str):
-        st.markdown(insight)
-
-
-def render_readonly_grid(slots: list[dict], container_key: str,
-                          height: int = 760, cell_height: int = 80) -> None:
-    """Render slots at their saved x/y/w/h with drag/resize disabled — used
-    by the template view so a re-run reproduces the exact layout the user
-    arranged at finalize time."""
-    tiles = []
-    for s in slots:
-        x = int(s.get("x", 0) or 0)
-        y = int(s.get("y", 0) or 0)
-        w = int(s.get("w", 6) or 6)
-        h = int(s.get("h", 4) or 4)
-        chart_json = json.dumps(s.get("chart") or {}, default=str)
-        host_id = f"ro-chart-{container_key}-{x}-{y}-{w}-{h}"
-        # Only the chart goes inside the tile — no title bar, no scripts visible.
-        tiles.append(f"""
-          <div class="grid-stack-item" gs-x="{x}" gs-y="{y}" gs-w="{w}" gs-h="{h}" gs-no-resize gs-no-move>
-            <div class="grid-stack-item-content tile">
-              <div class="chart-host" id="{host_id}"></div>
-              <script type="application/json" class="chart-config" data-host="{host_id}">{chart_json}</script>
-            </div>
-          </div>
-        """)
-
+def render_chart(chart: dict, container_key: str, height: int = 380):
+    """Drop one Highcharts chart into the page."""
+    config = json.dumps(_sanitize(chart), default=str)
+    cid = f"chart-{container_key}"
     html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <link href="https://cdn.jsdelivr.net/npm/gridstack@10.1.2/dist/gridstack.min.css" rel="stylesheet"/>
-      <script src="https://cdn.jsdelivr.net/npm/gridstack@10.1.2/dist/gridstack-all.js"></script>
+    <!DOCTYPE html><html><head>
+      <style>body{{margin:0;padding:0;background:transparent;font-family:-apple-system,BlinkMacSystemFont,sans-serif;}}#{cid}{{width:100%;height:{height-20}px;}}</style>
       <script>{_HIGHCHARTS_JS}</script>
-      <style>
-        body {{ margin:0; padding:0; background:transparent;
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }}
-        .grid-stack {{ background: rgba(0,0,0,0.015); border-radius: 6px; }}
-        .grid-stack-item-content.tile {{
-          background: #fff; border: 1px solid #e5e7eb; border-radius: 8px;
-          overflow: hidden;
-        }}
-        .chart-host {{ width: 100%; height: 100%; padding: 4px; box-sizing: border-box; }}
-      </style>
-    </head>
-    <body>
-      <div class="grid-stack">{''.join(tiles)}</div>
+    </head><body>
+      <div id="{cid}"></div>
       <script>
-        GridStack.init({{
-          column: 12, cellHeight: {cell_height},
-          margin: 6, float: true,
-          disableDrag: true, disableResize: true, staticGrid: true,
-        }});
-        document.querySelectorAll('.chart-config').forEach(s => {{
-          const hostId = s.dataset.host;
-          try {{
-            const cfg = JSON.parse(s.textContent);
-            if (!cfg.chart) cfg.chart = {{}};
-            cfg.chart.renderTo = hostId;
-            if (!cfg.credits) cfg.credits = {{ enabled: false }};
-            cfg.title = cfg.title || {{}};
-            if (typeof cfg.title === 'string') cfg.title = {{ text: cfg.title }};
-            cfg.title.style = Object.assign({{ fontSize: '13px' }}, cfg.title.style || {{}});
-            Highcharts.chart(cfg);
-          }} catch (e) {{
-            const host = document.getElementById(hostId);
-            if (host) host.innerText = '⚠ chart render failed';
-          }}
-        }});
+        var cfg={config};
+        if(!cfg.chart) cfg.chart={{}}; cfg.chart.renderTo='{cid}';
+        if(!cfg.credits) cfg.credits={{enabled:false}};
+        Highcharts.chart(cfg);
       </script>
-    </body>
-    </html>
+    </body></html>"""
+    components.html(html, height=height, scrolling=False)
+
+
+def render_freeform_canvas(slots: list[dict], draft_id: str, height: int = 720):
+    """Render a free-form canvas with drag-to-move and resize-edge support.
+
+    Each tile is absolutely-positioned via CSS using its (x, y, w, h)
+    fractions of the canvas. A small homemade drag handler (no GridStack
+    dependency — that combo of column=100 + cellHeight=8 didn't render
+    reliably) PATCHes the server on drop with the new fractional coords.
     """
-    components.html(html, height=height, scrolling=True)
+    canvas_h = height - 60   # leaves room for the status bar above
 
-
-def render_gridstack_canvas(slots: list[dict], draft_id: str, api_base: str,
-                             height: int = 760, cell_height: int = 80) -> None:
-    """Render the active draft's slots as a GridStack 2D grid.
-
-    Each tile is draggable and resizable at pixel precision. On every drag or
-    resize the new layout (x, y, w, h per tile) is PATCHed straight to the
-    FastAPI `/canvas/drafts/{draft_id}` endpoint from inside the iframe, so
-    positions persist instantly without needing a Streamlit rerun.
-
-    After dragging, click the "🔄 Pull latest layout" button below the canvas
-    to have Streamlit re-fetch from the DB (updates other views — e.g., the
-    finalize payload).
-    """
-    # Build one gridstack-item per slot. Only the chart goes into the tile —
-    # no title bar, no data, no insight, no script. Highcharts already paints
-    # its own chart.title inside the chart, so a redundant header would just
-    # eat vertical space.
-    items_html = []
+    items: list[str] = []
     for s in slots:
-        x = int(s.get("x", 0) or 0)
-        y = int(s.get("y", 0) or 0)
-        w = int(s.get("w", 6) or 6)
-        h = int(s.get("h", 4) or 4)
-        chart_obj = s.get("chart") or {}
-        cid = chart_obj.get("chart_id") or s.get("source") or ""
-        chart_json = json.dumps(chart_obj, default=str)
-        items_html.append(f"""
-          <div class="grid-stack-item"
-               gs-x="{x}" gs-y="{y}" gs-w="{w}" gs-h="{h}"
-               gs-id="{cid}">
-            <div class="grid-stack-item-content tile">
-              <button class="tile-rm" data-source="{cid}" title="Remove from canvas">✕</button>
-              <div class="chart-host" id="chart-{cid}"></div>
-              <script type="application/json" class="chart-config">{chart_json}</script>
-            </div>
+        x = float(s.get("x", 0) or 0)
+        y = float(s.get("y", 0) or 0)
+        w = float(s.get("w", 0.5) or 0.5)
+        h = float(s.get("h", 0.4) or 0.4)
+        ch = s.get("chart") or {}
+        cid = ch.get("chart_id") or s.get("chart_id") or ""
+        items.append(f"""
+          <div class="tile" data-cid="{cid}"
+               style="left:{x*100:.4f}%;top:{y*100:.4f}%;width:{w*100:.4f}%;height:{h*100:.4f}%;">
+            <button class="rm" data-cid="{cid}" title="Remove">✕</button>
+            <div class="re" title="Drag to resize"></div>
+            <div class="host" id="host-{cid}"></div>
+            <script type="application/json" class="cfg">{json.dumps(_sanitize(ch), default=str)}</script>
           </div>
         """)
 
-    slots_payload_json = json.dumps(slots, default=str)
-
+    slots_payload = json.dumps(_sanitize(slots), default=str)
     html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <link href="https://cdn.jsdelivr.net/npm/gridstack@10.1.2/dist/gridstack.min.css" rel="stylesheet"/>
-      <script src="https://cdn.jsdelivr.net/npm/gridstack@10.1.2/dist/gridstack-all.js"></script>
+    <!DOCTYPE html><html><head>
       <script>{_HIGHCHARTS_JS}</script>
       <style>
-        body {{ margin:0; padding:0; background:transparent;
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }}
-        .grid-stack {{ background: rgba(0,0,0,0.015); border-radius: 6px; min-height: {cell_height * 6}px; }}
-        .grid-stack-item-content.tile {{
-          background: #fff; border: 1px solid #e5e7eb; border-radius: 8px;
-          box-shadow: 0 1px 3px rgba(0,0,0,.04); overflow: hidden;
-          cursor: move; position: relative;
-        }}
-        /* The chart fills the whole tile — no title bar, no script preview,
-           no data dump. Just the graph. */
-        .chart-host {{ width: 100%; height: 100%; padding: 4px; box-sizing: border-box; }}
-        /* Floating remove button in the top-right corner (only on hover so
-           it doesn't compete with the chart). */
-        .tile-rm {{
-          position: absolute; top: 4px; right: 6px;
-          border: 0; background: rgba(255,255,255,.85); cursor: pointer;
-          color: #991b1b; font-size: 13px; padding: 2px 6px; border-radius: 4px;
-          opacity: 0; transition: opacity .15s ease; z-index: 5;
-          line-height: 1;
-        }}
-        .grid-stack-item-content.tile:hover .tile-rm {{ opacity: 1; }}
-        .tile-rm:hover {{ color: #dc2626; background: #fff; }}
-        .status {{ font-size: 12px; color: #6b7280; padding: 4px 2px; }}
-        .status.saving {{ color: #2563eb; }}
-        .status.saved  {{ color: #16a34a; }}
-        .status.error  {{ color: #dc2626; }}
+        body{{margin:0;padding:0;background:transparent;font-family:-apple-system,BlinkMacSystemFont,sans-serif;}}
+        .status{{font-size:12px;color:#6b7280;padding:4px 2px;}}
+        .status.saving{{color:#2563eb;}}.status.saved{{color:#16a34a;}}.status.error{{color:#dc2626;}}
+        .canvas{{position:relative;width:100%;height:{canvas_h}px;background:rgba(0,0,0,.015);border-radius:6px;overflow:hidden;}}
+        .tile{{position:absolute;background:#fff;border:1px solid #e5e7eb;border-radius:8px;
+               box-shadow:0 1px 3px rgba(0,0,0,.04);overflow:hidden;box-sizing:border-box;cursor:move;}}
+        .tile.dragging{{z-index:1000;opacity:.92;box-shadow:0 6px 18px rgba(0,0,0,.18);}}
+        .host{{position:absolute;inset:4px;}}
+        .rm{{position:absolute;top:4px;right:6px;border:0;background:rgba(255,255,255,.85);cursor:pointer;
+             color:#991b1b;font-size:13px;padding:2px 6px;border-radius:4px;
+             opacity:0;transition:opacity .15s;z-index:5;line-height:1;}}
+        .tile:hover .rm{{opacity:1;}}
+        .rm:hover{{color:#dc2626;background:#fff;}}
+        .re{{position:absolute;right:0;bottom:0;width:14px;height:14px;cursor:nwse-resize;z-index:6;
+             background:linear-gradient(135deg,transparent 50%,#94a3b8 50%);border-bottom-right-radius:8px;opacity:.6;}}
+        .re:hover{{opacity:1;}}
       </style>
-    </head>
-    <body>
-      <div id="status" class="status">Ready.</div>
-      <div class="grid-stack">
-        {''.join(items_html)}
-      </div>
+    </head><body>
+      <div id="status" class="status">Ready · drag tiles to move, drag the corner to resize · auto-saves</div>
+      <div class="canvas" id="canvas">{''.join(items)}</div>
 
       <script>
         const DRAFT_ID = {json.dumps(draft_id)};
-        const API_BASE = {json.dumps(api_base)};
-        const STATUS = document.getElementById('status');
-        // Snapshot of the slots as currently in the DB, keyed by source.
-        const BASE_SLOTS = {slots_payload_json};
-        const SLOT_BY_SRC = {{}};
-        BASE_SLOTS.forEach(s => {{
-          const src = (s.chart && s.chart.chart_id) || s.source || '';
-          SLOT_BY_SRC[src] = s;
+        const API_BASE = {json.dumps(API_BASE)};
+        const STATUS   = document.getElementById('status');
+        const CANVAS   = document.getElementById('canvas');
+
+        // Keep slot data + chart instance keyed by chart_id so we can
+        // PATCH the latest layout and call chart.reflow() after resize.
+        const SLOTS = {{}};
+        const CHARTS = {{}};
+        ({slots_payload}).forEach(s => {{
+          const cid = (s.chart && s.chart.chart_id) || s.chart_id || '';
+          if (cid) SLOTS[cid] = s;
         }});
 
-        // Render every chart into its host element.
-        document.querySelectorAll('.grid-stack-item').forEach(el => {{
-          const cfgScript = el.querySelector('.chart-config');
-          const host = el.querySelector('.chart-host');
-          if (!cfgScript || !host) return;
-          try {{
-            const cfg = JSON.parse(cfgScript.textContent);
-            if (!cfg.chart) cfg.chart = {{}};
-            cfg.chart.renderTo = host.id;
-            if (!cfg.credits) cfg.credits = {{ enabled: false }};
-            // Shrink font slightly so things fit inside tiles.
-            cfg.title = cfg.title || {{}};
-            if (typeof cfg.title === 'string') cfg.title = {{ text: cfg.title }};
-            cfg.title.style = Object.assign({{ fontSize: '13px' }}, cfg.title.style || {{}});
-            Highcharts.chart(cfg);
-          }} catch (e) {{
-            host.innerText = '⚠ chart render failed';
-          }}
+        // Render charts AFTER the DOM is laid out (their hosts already
+        // have real pixel sizes from the absolute-positioned .tile).
+        function renderCharts() {{
+          document.querySelectorAll('.tile').forEach(tile => {{
+            const cid = tile.dataset.cid;
+            const cfg_el = tile.querySelector('.cfg');
+            const host = tile.querySelector('.host');
+            if (!cfg_el || !host || CHARTS[cid]) return;
+            try {{
+              const cfg = JSON.parse(cfg_el.textContent);
+              if (!cfg.chart) cfg.chart = {{}};
+              cfg.chart.renderTo = host.id;
+              if (!cfg.credits) cfg.credits = {{ enabled: false }};
+              cfg.title = cfg.title || {{}};
+              if (typeof cfg.title === 'string') cfg.title = {{ text: cfg.title }};
+              cfg.title.style = Object.assign({{fontSize:'13px'}}, cfg.title.style || {{}});
+              CHARTS[cid] = Highcharts.chart(cfg);
+            }} catch (e) {{
+              host.innerText = '⚠ render failed: ' + (e && e.message || e);
+              console.error('chart render failed for', cid, e);
+            }}
+          }});
+        }}
+        // Wait for two frames to be sure layout is final, then render.
+        requestAnimationFrame(() => requestAnimationFrame(renderCharts));
+
+        // ─── drag-to-move + corner-to-resize ─────────────────────────────
+        let saveTimer = null;
+        function scheduleSave() {{
+          clearTimeout(saveTimer);
+          saveTimer = setTimeout(persistLayout, 250);
+        }}
+
+        function tileFractions(tile) {{
+          const cw = CANVAS.getBoundingClientRect().width;
+          const ch = CANVAS.getBoundingClientRect().height;
+          const r  = tile.getBoundingClientRect();
+          const cr = CANVAS.getBoundingClientRect();
+          return {{
+            x: (r.left - cr.left) / cw,
+            y: (r.top  - cr.top)  / ch,
+            w: r.width  / cw,
+            h: r.height / ch,
+          }};
+        }}
+
+        function attachDrag(tile) {{
+          tile.addEventListener('mousedown', (e) => {{
+            // Skip if the click hit the resize handle or the remove button
+            if (e.target.classList.contains('re') || e.target.classList.contains('rm')) return;
+            e.preventDefault();
+            tile.classList.add('dragging');
+            const startX = e.clientX, startY = e.clientY;
+            const startLeft = tile.offsetLeft, startTop = tile.offsetTop;
+            function move(ev) {{
+              const dx = ev.clientX - startX, dy = ev.clientY - startY;
+              const cw = CANVAS.clientWidth, chx = CANVAS.clientHeight;
+              const nx = Math.max(0, Math.min(cw - tile.offsetWidth,  startLeft + dx));
+              const ny = Math.max(0, Math.min(chx - tile.offsetHeight, startTop  + dy));
+              tile.style.left = (nx / cw  * 100) + '%';
+              tile.style.top  = (ny / chx * 100) + '%';
+            }}
+            function up() {{
+              tile.classList.remove('dragging');
+              document.removeEventListener('mousemove', move);
+              document.removeEventListener('mouseup', up);
+              const f = tileFractions(tile);
+              const cid = tile.dataset.cid;
+              if (SLOTS[cid]) {{
+                Object.assign(SLOTS[cid], f);
+                scheduleSave();
+              }}
+            }}
+            document.addEventListener('mousemove', move);
+            document.addEventListener('mouseup', up);
+          }});
+        }}
+
+        function attachResize(tile) {{
+          const handle = tile.querySelector('.re');
+          if (!handle) return;
+          handle.addEventListener('mousedown', (e) => {{
+            e.preventDefault(); e.stopPropagation();
+            tile.classList.add('dragging');
+            const startX = e.clientX, startY = e.clientY;
+            const startW = tile.offsetWidth, startH = tile.offsetHeight;
+            function move(ev) {{
+              const dw = ev.clientX - startX, dh = ev.clientY - startY;
+              const cw = CANVAS.clientWidth, chx = CANVAS.clientHeight;
+              const nw = Math.max(80, Math.min(cw - tile.offsetLeft, startW + dw));
+              const nh = Math.max(80, Math.min(chx - tile.offsetTop, startH + dh));
+              tile.style.width  = (nw / cw  * 100) + '%';
+              tile.style.height = (nh / chx * 100) + '%';
+              const c = CHARTS[tile.dataset.cid];
+              if (c && c.reflow) c.reflow();
+            }}
+            function up() {{
+              tile.classList.remove('dragging');
+              document.removeEventListener('mousemove', move);
+              document.removeEventListener('mouseup', up);
+              const f = tileFractions(tile);
+              const cid = tile.dataset.cid;
+              if (SLOTS[cid]) {{
+                Object.assign(SLOTS[cid], f);
+                scheduleSave();
+              }}
+              const c = CHARTS[cid];
+              if (c && c.reflow) c.reflow();
+            }}
+            document.addEventListener('mousemove', move);
+            document.addEventListener('mouseup', up);
+          }});
+        }}
+
+        document.querySelectorAll('.tile').forEach(tile => {{
+          attachDrag(tile);
+          attachResize(tile);
         }});
 
-        // Initialise GridStack with a 12-col grid.
-        const grid = GridStack.init({{
-          column: 12, cellHeight: {cell_height},
-          margin: 6, float: true, animate: true,
+        // Remove button
+        document.querySelectorAll('.rm').forEach(btn => {{
+          btn.addEventListener('click', (e) => {{
+            e.stopPropagation();
+            const cid = btn.dataset.cid;
+            delete SLOTS[cid];
+            const c = CHARTS[cid];
+            if (c) {{ try {{ c.destroy(); }} catch (e) {{}}; delete CHARTS[cid]; }}
+            const tile = document.querySelector(`.tile[data-cid="${{cid}}"]`);
+            if (tile) tile.remove();
+            scheduleSave();
+          }});
         }});
 
         async function persistLayout() {{
-          // Serialise current positions
-          const positions = grid.save(false);  // [{{id, x, y, w, h}}...]
-          const byId = Object.fromEntries(positions.map(p => [p.id, p]));
-          const newSlots = Object.values(SLOT_BY_SRC).map(s => {{
-            const src = (s.chart && s.chart.chart_id) || s.source || '';
-            const pos = byId[src];
-            if (!pos) return s;  // removed
-            return Object.assign({{}}, s, {{
-              x: pos.x, y: pos.y, w: pos.w, h: pos.h,
-            }});
-          }}).filter(s => {{
-            const src = (s.chart && s.chart.chart_id) || s.source || '';
-            return byId[src] != null;
-          }});
-
-          STATUS.textContent = 'Saving layout…';
-          STATUS.className = 'status saving';
+          STATUS.textContent='Saving layout…'; STATUS.className='status saving';
           try {{
-            const res = await fetch(`${{API_BASE}}/canvas/drafts/${{DRAFT_ID}}`, {{
+            const r = await fetch(`${{API_BASE}}/canvas/drafts/${{DRAFT_ID}}`, {{
               method: 'PATCH',
-              headers: {{ 'Content-Type': 'application/json' }},
-              body: JSON.stringify({{ slots: newSlots }}),
+              headers: {{'Content-Type': 'application/json'}},
+              body: JSON.stringify({{ slots: Object.values(SLOTS) }}),
             }});
-            if (!res.ok) throw new Error('HTTP ' + res.status);
-            STATUS.textContent = 'Layout saved · ' + new Date().toLocaleTimeString();
-            STATUS.className = 'status saved';
+            if (!r.ok) throw new Error('HTTP '+r.status);
+            STATUS.textContent='Saved · ' + new Date().toLocaleTimeString();
+            STATUS.className='status saved';
           }} catch (e) {{
-            STATUS.textContent = 'Save failed: ' + e.message;
-            STATUS.className = 'status error';
+            STATUS.textContent='Save failed: ' + e.message;
+            STATUS.className='status error';
           }}
         }}
-
-        // Persist after drag or resize stops.
-        grid.on('change', () => {{ persistLayout(); }});
-
-        // Tile-level remove button.
-        document.querySelectorAll('.tile-rm').forEach(btn => {{
-          btn.addEventListener('click', async (e) => {{
-            e.stopPropagation();
-            const src = btn.dataset.source;
-            delete SLOT_BY_SRC[src];
-            const el = document.querySelector(`.grid-stack-item[gs-id="${{src}}"]`);
-            if (el) grid.removeWidget(el);
-            await persistLayout();
-          }});
-        }});
       </script>
-    </body>
-    </html>
-    """
-    components.html(html, height=height, scrolling=True)
-
-
-def render_highchart(chart_config: dict, container_key: str, height: int = 380):
-    config_json = json.dumps(chart_config, default=str)
-    container_id = f"chart-{container_key}"
-    html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="utf-8">
-        <style>
-            body {{ margin: 0; padding: 0; background: transparent; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }}
-            #{container_id} {{ width: 100%; height: {height - 20}px; }}
-        </style>
-        <script>{_HIGHCHARTS_JS}</script>
-    </head>
-    <body>
-        <div id="{container_id}"></div>
-        <script>
-            var config = {config_json};
-            if (!config.chart) config.chart = {{}};
-            config.chart.renderTo = '{container_id}';
-            if (!config.credits) config.credits = {{ enabled: false }};
-            Highcharts.chart(config);
-        </script>
-    </body>
-    </html>
+    </body></html>
     """
     components.html(html, height=height, scrolling=False)
 
 
-# ── Thin shims that adapt the typed ApiClient to the legacy dict-shaped
-# call sites in the rest of this file. New code should call `api.X()`
-# directly; these stay for compatibility while the rest of the file is
-# being incrementally cleaned up.
-#
-# All errors get surfaced to the user via `_show_api_error(...)` so we
-# never silently swallow a failure.
-
-def _show_api_error(action: str, e: ApiError) -> None:
-    """One canonical error renderer — uses the structured field errors when
-    the server returned FastAPI's validation array."""
-    if e.field_errors:
-        st.error(f"{action} failed ({e.status}) — server rejected the payload:")
-        for loc, msg in e.field_errors[:6]:
-            st.markdown(f"- **`{loc}`** — {msg}")
-    else:
-        st.error(f"{action} failed ({e.status}): {e.detail}")
-
-
-def api_list_drafts(user_id: str) -> list[dict]:
-    """Return every draft for the user with its slots inlined.
-
-    The API's `GET /canvas/drafts` returns metadata only (cheap listing);
-    we hydrate each draft via `GET /canvas/drafts/{id}` so the UI can show
-    slot counts, render the active canvas, and dedupe on add. With <50
-    drafts per user, the per-draft fetch is sub-ms thanks to the connection
-    pool — well within Streamlit's render budget.
-    """
-    try:
-        meta_drafts = api.list_drafts(user_id)
-    except (ApiError, requests.RequestException):
-        return []
-
-    out: list[dict] = []
-    for d in meta_drafts:
-        try:
-            full = api.get_draft(d.draft_id)
-            out.append(full.model_dump())
-        except (ApiError, requests.RequestException):
-            # Fall back to metadata-only on any per-draft hiccup.
-            out.append({**d.model_dump(), "slots": []})
-    return out
-
-
-def api_create_draft(user_id: str, name: str, project_type: str) -> dict | None:
-    try:
-        return api.create_draft(user_id=user_id, name=name, project_type=project_type).model_dump()
-    except ApiError as e:
-        _show_api_error("Create draft", e); return None
-
-
-def api_patch_draft(draft_id: str, name=None, slots=None) -> dict | None:
-    try:
-        # _sanitize_for_json: keep NaN/Inf out of the JSON body
-        clean_slots = _sanitize_for_json(slots) if slots is not None else None
-        return api.patch_draft(draft_id, name=name, slots=clean_slots).model_dump()
-    except ApiError as e:
-        _show_api_error("Update draft", e); return None
+def render_readonly_grid(slots: list[dict], container_key: str, height: int = 720):
+    """Render slots at their saved positions, no drag — used in template view.
+    Same CSS-absolute-positioning approach as the editable canvas, just
+    without drag/resize handlers."""
+    canvas_h = height - 20
+    items: list[str] = []
+    for s in slots:
+        x = float(s.get("x", 0) or 0)
+        y = float(s.get("y", 0) or 0)
+        w = float(s.get("w", 0.5) or 0.5)
+        h = float(s.get("h", 0.4) or 0.4)
+        ch = s.get("chart") or {}
+        cid = ch.get("chart_id") or ""
+        host_id = f"ro-host-{container_key}-{cid}"
+        items.append(f"""
+          <div class="tile" style="left:{x*100:.4f}%;top:{y*100:.4f}%;width:{w*100:.4f}%;height:{h*100:.4f}%;">
+            <div class="host" id="{host_id}"></div>
+            <script type="application/json" class="cfg" data-host="{host_id}">{json.dumps(_sanitize(ch), default=str)}</script>
+          </div>
+        """)
+    html = f"""
+    <!DOCTYPE html><html><head>
+      <script>{_HIGHCHARTS_JS}</script>
+      <style>
+        body{{margin:0;padding:0;background:transparent;font-family:-apple-system,BlinkMacSystemFont,sans-serif;}}
+        .canvas{{position:relative;width:100%;height:{canvas_h}px;background:rgba(0,0,0,.015);border-radius:6px;overflow:hidden;}}
+        .tile{{position:absolute;background:#fff;border:1px solid #e5e7eb;border-radius:8px;
+               box-shadow:0 1px 3px rgba(0,0,0,.04);overflow:hidden;box-sizing:border-box;}}
+        .host{{position:absolute;inset:4px;}}
+      </style>
+    </head><body>
+      <div class="canvas">{''.join(items)}</div>
+      <script>
+        const RO_CHARTS = [];
+        function renderRO() {{
+          document.querySelectorAll('.cfg').forEach(s => {{
+            try {{
+              const cfg = JSON.parse(s.textContent);
+              if (!cfg.chart) cfg.chart = {{}};
+              cfg.chart.renderTo = s.dataset.host;
+              if (!cfg.credits) cfg.credits = {{enabled:false}};
+              RO_CHARTS.push(Highcharts.chart(cfg));
+            }} catch (e) {{
+              const h = document.getElementById(s.dataset.host);
+              if (h) h.innerText = '⚠ render failed: ' + (e && e.message || e);
+              console.error('RO chart render failed', e);
+            }}
+          }});
+        }}
+        // Two RAF beats so layout has stabilized before Highcharts measures.
+        requestAnimationFrame(() => requestAnimationFrame(renderRO));
+      </script>
+    </body></html>"""
+    components.html(html, height=height, scrolling=True)
 
 
-def api_delete_draft(draft_id: str) -> bool:
-    try:
-        return api.delete_draft(draft_id)
-    except ApiError:
+def show_api_status(label: str, status: int, err: str | None) -> bool:
+    """Render success/error banner under an action button. Returns True on OK."""
+    if err:
+        st.error(f"{label} failed — {err}")
         return False
-
-
-def api_list_thread_messages(thread_id: str, user_id: str) -> list[dict]:
-    """Server enforces ownership — pass the current user_id."""
-    try:
-        return api.list_thread_messages(thread_id, user_id=user_id)
-    except (ApiError, requests.RequestException):
-        return []
-
-
-def _messages_to_query_records(messages: list[dict]) -> list[dict]:
-    """Pair the flat user/ai message stream back into per-turn records the
-    chat renderer expects. Same `query_id` pairs them; user.content → query
-    text, ai.content → rationale, ai.charts → charts."""
-    by_qid: dict[str, dict] = {}
-    order: list[str] = []
-    for m in messages:
-        qid = m.get("query_id") or ""
-        if qid not in by_qid:
-            by_qid[qid] = {"query_id": qid, "query": "", "rationale": "", "charts": []}
-            order.append(qid)
-        if m.get("role") == "user":
-            by_qid[qid]["query"] = m.get("content") or ""
-        elif m.get("role") == "ai":
-            by_qid[qid]["rationale"] = m.get("content") or ""
-            by_qid[qid]["charts"] = m.get("charts") or []
-    return [by_qid[q] for q in order]
+    if status >= 200 and status < 300:
+        return True
+    st.error(f"{label} unexpected status {status}")
+    return False
 
 
 # ── Page setup ──────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="Reporting Agent", page_icon="📊", layout="wide")
-st.title("Reporting Agent")
-st.caption("Ask on the left. Drop the graphs you want onto the canvas on the right. Finalize to save a reusable report.")
+st.title("📊 Reporting Agent")
+st.caption("Chat → canvas → template → re-run/download. Every API endpoint is exercised here.")
 
 
 # ── Session state ───────────────────────────────────────────────────────────
 
 def _init_state():
-    if "thread_id" not in st.session_state:
-        st.session_state.thread_id = str(uuid.uuid4())
-    # Chat conversation for the current thread (list of query records).
-    # This is rehydrated from the server on every render if empty, so a
-    # browser refresh doesn't wipe prior Q&A turns.
-    if "queries" not in st.session_state:
-        st.session_state.queries = []
-    if "active_draft_id" not in st.session_state:
-        st.session_state.active_draft_id = None
-    if "template_view" not in st.session_state:
-        st.session_state.template_view = None
-
+    if "thread_id"        not in st.session_state: st.session_state.thread_id = str(uuid.uuid4())
+    if "queries"          not in st.session_state: st.session_state.queries = []
+    if "active_draft_id"  not in st.session_state: st.session_state.active_draft_id = None
+    if "template_view"    not in st.session_state: st.session_state.template_view = None
 _init_state()
 
 
 # ── Sidebar ─────────────────────────────────────────────────────────────────
 
-def _list_threads_for_user(uid: str) -> list[dict]:
-    """Pull every thread this user has, newest first. Empty list on error."""
-    try:
-        return [t.model_dump() for t in api.list_threads(uid)]
-    except (ApiError, requests.RequestException):
-        return []
-
-
-def _list_queries_in_thread(tid: str, uid: str) -> list[dict]:
-    """Sidebar Q list for an inactive thread. Pulls the chat messages and
-    keeps just the user-side entries (the questions). Ownership-checked."""
-    try:
-        msgs = api.list_thread_messages(tid, user_id=uid)
-    except (ApiError, requests.RequestException):
-        return []
-    # Sidebar only needs each user question — flatten ai messages out.
-    return [
-        {"query_id": m.get("query_id"),
-         "original_query": m.get("content") or "",
-         "rationale": ""}
-        for m in msgs if m.get("role") == "user"
-    ]
-
-
 with st.sidebar:
     st.header("Settings")
-    user_id = st.text_input("User ID", value="demo_user")
-    project_type = st.selectbox("Project Type", options=PROJECT_TYPES, index=0)
-    max_charts = st.slider("Max charts per query", 1, 5, 3)
+    user_id      = st.text_input("User ID", value="demo_user")
+    project_type = st.selectbox("Project type", PROJECT_TYPES, index=0)
+    max_charts   = st.slider("Max charts per query", 1, 5, 3)
 
     st.divider()
     if st.button("➕ New thread", use_container_width=True, type="primary"):
         st.session_state.thread_id = str(uuid.uuid4())
         st.session_state.queries = []
-        st.session_state.active_draft_id = None
-        st.session_state.template_view = None
         st.rerun()
 
-    # ── Past threads — switch in/out, see the Q history ──────────────────
-    st.subheader("💬 Past chats")
-    threads = _list_threads_for_user(user_id)
-    if not threads:
-        st.caption("_No past chats yet — ask something to start one._")
+    st.subheader("💬 Past threads")
+    if st.button("🩺 Health check", use_container_width=True):
+        st_h, body, err = api_health()
+        if not err:
+            st.success("Server OK")
+        else:
+            st.error(err)
+
+    s, body, err = api_list_threads(user_id)
+    threads = (body or {}).get("threads") or []
+    if err:
+        st.caption(f"_thread fetch error: {err}_")
+    elif not threads:
+        st.caption("_No past threads — ask something to start one._")
     else:
         st.caption(f"{len(threads)} thread(s) for `{user_id}`")
-        for t in threads:
-            tid = t.get("thread_id")
-            is_active = (tid == st.session_state.thread_id)
-            title = (t.get("title") or "").strip() or "(untitled)"
-            updated = str(t.get("updated_at") or "")[:16]   # YYYY-MM-DD HH:MM
-
-            # Cache per-thread Q lists for inactive threads (they don't change),
-            # but always refetch the active thread so a brand-new question
-            # shows up in the sidebar without a manual refresh.
-            cache_key = f"_thread_qs_{tid}"
-            if is_active or cache_key not in st.session_state:
-                st.session_state[cache_key] = _list_queries_in_thread(tid, user_id)
-            qs = st.session_state[cache_key]
-
-            label = f"{'🟢' if is_active else '💬'}  {title[:48]}"
-            with st.expander(label, expanded=is_active):
-                st.caption(f"`{tid[:8]}…` · last activity: `{updated}` · {len(qs)} Q")
-                # Show the Q (and a short A preview) for each turn
-                for i, q in enumerate(qs, 1):
-                    qtxt = (q.get("original_query") or "").strip() or "(empty)"
-                    rat  = (q.get("rationale")      or "").strip()
-                    st.markdown(f"**Q{i}.** {qtxt}")
-                    if rat:
-                        st.caption(f"_{rat[:140]}{'…' if len(rat) > 140 else ''}_")
-                # Switch action
-                if not is_active:
-                    if st.button("Open this thread",
-                                 key=f"open_thr_{tid}",
-                                 use_container_width=True):
+        for t in threads[:30]:
+            tid    = t.get("thread_id")
+            title  = (t.get("title") or "(untitled)").strip()[:60]
+            active = (tid == st.session_state.thread_id)
+            label  = f"{'🟢' if active else '💬'}  {title}"
+            with st.expander(label, expanded=active):
+                st.caption(f"`{tid[:8]}…` · updated `{str(t.get('updated_at') or '')[:19]}`")
+                if not active:
+                    if st.button("Open this thread", key=f"open_{tid}", use_container_width=True):
                         st.session_state.thread_id = tid
-                        st.session_state.queries = []           # forces rehydrate
-                        st.session_state.active_draft_id = None
-                        st.session_state.template_view = None
+                        st.session_state.queries = []
                         st.rerun()
                 else:
-                    st.caption("✅ Currently open in chat.")
-
-    st.divider()
-    try:
-        _n_templates = len(api.list_templates(user_id))
-    except (ApiError, requests.RequestException):
-        _n_templates = 0
-    try:
-        _n_drafts = len(api.list_drafts(user_id))
-    except (ApiError, requests.RequestException):
-        _n_drafts = 0
-    st.caption(f"📚 **{_n_drafts}** canvas draft(s) · **{_n_templates}** template(s)")
-    st.caption("_Manage them in the **Canvas** and **Templates** tabs →_")
+                    st.caption("✅ Currently open")
 
 
-# ── Rehydrate chat from the DB ──────────────────────────────────────────────
+# ── Hydrate the open chat thread from /messages ─────────────────────────────
 
 if not st.session_state.queries:
-    # Pull the thread as a chat-style message list (user/ai pairs).
-    # Re-pair the messages back into per-turn records the renderer expects:
-    # one record per query_id with {query, rationale, charts}.
-    messages = api_list_thread_messages(st.session_state.thread_id, user_id)
-    paired = _messages_to_query_records(messages)
-    rebuilt = []
-    for row in paired:
-        qid = row.get("query_id") or str(uuid.uuid4())
-        rebuilt.append({
-            "query_id":           qid,
-            "query":              row.get("query") or "",
-            "project_type":       "",
-            "charts":             row.get("charts") or [],
-            "rationale":          row.get("rationale") or "",
-            "traversal_steps":    0,
-            "traversal_findings": "",
-            "retrieval_nodes":    [],
-            "retrieval_paths":    [],
-        })
-    if rebuilt:
-        st.session_state.queries = rebuilt
+    s, body, err = api_thread_messages(st.session_state.thread_id, user_id)
+    if not err and isinstance(body, dict):
+        # Pair user/ai messages back into per-turn records (chat renderer expects {query, rationale, charts}).
+        by_qid: dict[str, dict] = {}
+        order: list[str] = []
+        for m in body.get("messages") or []:
+            qid = m.get("query_id") or ""
+            if qid not in by_qid:
+                by_qid[qid] = {"query_id": qid, "query": "", "rationale": "", "charts": []}
+                order.append(qid)
+            if m.get("role") == "user":
+                by_qid[qid]["query"] = m.get("content") or ""
+            elif m.get("role") == "ai":
+                by_qid[qid]["rationale"] = m.get("content") or ""
+                by_qid[qid]["charts"]    = m.get("charts") or []
+        st.session_state.queries = [by_qid[q] for q in order]
 
 
-# ── Load drafts for this user (always fresh, never cached in memory) ──────
-# Drafts are user-scoped: every canvas the user has built across any thread
-# shows up here so they can drop new charts into an old report, not just the
-# one tied to the current chat.
+# ── Drafts list (always fresh — slots inlined by the API) ──────────────────
 
-drafts = api_list_drafts(user_id)
+s, body, err = api_list_drafts(user_id)
+drafts: list[dict] = (body or {}).get("drafts") or []
 
-# If the stored active_draft_id no longer exists, clear it.
-valid_draft_ids = {d["draft_id"] for d in drafts}
-if st.session_state.active_draft_id and st.session_state.active_draft_id not in valid_draft_ids:
+valid_did = {d["draft_id"] for d in drafts}
+if st.session_state.active_draft_id and st.session_state.active_draft_id not in valid_did:
     st.session_state.active_draft_id = None
 if not st.session_state.active_draft_id and drafts:
-    # Canvas drafts are user-scoped (no thread_id) — pick the most recently
-    # updated draft as the default active one. The list is already sorted
-    # newest-first by the backend.
     st.session_state.active_draft_id = drafts[0]["draft_id"]
 
 
-# ── Helpers used by chart cards ─────────────────────────────────────────────
+# ── Helpers used by the chat / canvas tabs ─────────────────────────────────
 
 def _slot_chart_id(s: dict) -> str:
-    """Return the slot's stable chart_id (lives inside `chart.chart_id`)."""
     ch = s.get("chart") if isinstance(s, dict) else None
-    return (ch.get("chart_id") if isinstance(ch, dict) else None) or ""
+    return (ch.get("chart_id") if isinstance(ch, dict) else None) or s.get("chart_id") or ""
 
+def _chart_in_draft(d: dict, cid: str) -> bool:
+    return any(_slot_chart_id(s) == cid for s in (d.get("slots") or []))
 
-def _chart_in_draft(draft: dict, chart_id: str) -> bool:
-    return any(_slot_chart_id(s) == chart_id for s in (draft.get("slots") or []))
-
-
-def _add_chart_to_draft(draft: dict, q_rec: dict, chart_idx: int):
+def _add_chart_to_draft(draft: dict, chart: dict) -> tuple[bool, str]:
+    """Append a chart to a draft as a new slot. Server clones chart_id on add."""
     slots = list(draft.get("slots") or [])
-    chart = q_rec["charts"][chart_idx]
-    # Defensive unwrap: if this came from /charts?query_id= as a row wrapper
-    # (top-level query_id/user_id/title_text), the actual chart object is at
-    # row["chart"]. Strict per-type schema rejects the row shape.
-    if isinstance(chart, dict) and "chart" in chart and isinstance(chart["chart"], dict) and chart["chart"].get("type") in (
-        "column", "bar", "line", "area", "spline", "areaspline", "scatter", "pie", "donut"
-    ) and chart.get("title_text") is not None:
-        chart = chart["chart"]
     cid = chart.get("chart_id") or ""
-
     if not cid:
-        return False, "Chart has no chart_id (regenerate the report)."
+        return False, "chart has no chart_id"
     if any(_slot_chart_id(s) == cid for s in slots):
-        return False, "Already in this draft."
+        return False, "already in this draft"
     if len(slots) >= MAX_REPORT_CHARTS:
-        return False, f"Draft is full ({MAX_REPORT_CHARTS} max)."
+        return False, f"draft is full ({MAX_REPORT_CHARTS} max)"
+    # Auto-place: stack new tile below everything else, half width / 0.4 height.
+    max_y = max((float(s.get("y", 0) or 0) + float(s.get("h", 0.4) or 0.4) for s in slots), default=0.0)
+    new_slot = {"chart": chart, "x": 0.0, "y": max_y, "w": 0.5, "h": 0.4}
+    slots.append(new_slot)
+    s_, body, err = api_patch_draft(draft["draft_id"], slots=slots)
+    if err:
+        return False, err
+    return True, "Added"
 
-    # CanvasSlot is just: chart + position. Provenance (query_id,
-    # original_query) lives on the chart row server-side — no need to
-    # repeat it here.
-    slots.append({
-        "position": len(slots),
-        "chart":    chart,
-    })
-    resp = api_patch_draft(draft["draft_id"], slots=slots)
-    return resp is not None, "Added."
-
-
-def _remove_slot(draft_id: str, slots: list, position: int):
-    new_slots = [s for s in slots if s.get("position") != position]
-    for i, s in enumerate(new_slots):
-        s["position"] = i
-    api_patch_draft(draft_id, slots=new_slots)
-
-
-def _sync_chart_everywhere_in_session(chart_id: str, patched_chart: dict):
-    """Mirror an edited chart into the in-session caches.
-
-    The DB now stores each canvas slot's chart under its OWN chart_id
-    (clone-on-add), so /charts/edit only mutates one row server-side.
-    This function just refreshes the Streamlit-side caches so the user
-    sees the new colors/labels without a hard reload — it doesn't leak
-    across canvases or back into the chat.
-    """
-    for q in st.session_state.queries:
-        for i, c in enumerate(q.get("charts", []) or []):
-            if isinstance(c, dict) and c.get("chart_id") == chart_id:
-                q["charts"][i] = patched_chart
-    for d in drafts:
-        slots = d.get("slots") or []
-        if isinstance(slots, str):
-            try:
-                slots = json.loads(slots)
-            except Exception:
-                continue
-        for s in slots:
-            ch = s.get("chart") if isinstance(s, dict) else None
-            if isinstance(ch, dict) and ch.get("chart_id") == chart_id:
-                s["chart"] = patched_chart
-
-
-@st.dialog("Edit chart")
+@st.dialog("Edit chart (NL)")
 def _edit_chart_dialog(chart_id: str, chart_title: str):
-    st.caption(f"Editing: **{chart_title}**")
-    st.write(
-        "Describe the change in plain English. Examples:\n"
-        "- _change the bars to red_\n"
-        "- _rename x-axis to Market and y-axis to Pending Sites_\n"
-        "- _sort descending and hide the legend_\n"
-    )
-    instruction = st.text_area(
-        "Your edit",
-        placeholder="e.g., change the color of the bars to red",
-        key=f"edit_input_{chart_id}",
-        height=100,
-    )
-    ca, cb = st.columns([1, 1])
-    with ca:
+    st.caption(f"Editing **{chart_title}**")
+    st.write("Examples: _change bars to red_, _hide the legend_, _rename y-axis to Sites/week_")
+    instr = st.text_area("Your edit", placeholder="e.g., make the bars red", height=100, key=f"edit_in_{chart_id}")
+    c1, c2 = st.columns(2)
+    with c1:
         apply = st.button("Apply edit", type="primary", use_container_width=True)
-    with cb:
-        if st.button("Cancel", use_container_width=True):
-            st.rerun()
+    with c2:
+        if st.button("Cancel", use_container_width=True): st.rerun()
     if apply:
-        if not instruction.strip():
+        if not instr.strip():
             st.warning("Please describe the change first.")
-            st.stop()
-        try:
-            with st.spinner("Patching the chart config..."):
-                edit = api.edit_chart(chart_id, instruction.strip())
-            patched = edit.chart  # plain dict on read
-            _sync_chart_everywhere_in_session(chart_id, patched)
-            st.success("Edit applied and saved.")
-            st.rerun()
-        except ApiError as e:
-            _show_api_error("Chart edit", e); st.stop()
-        except requests.RequestException as e:
-            st.error(f"Edit failed: {e}")
-
-
-# ── Run a new query ─────────────────────────────────────────────────────────
-
-def _run_query(query: str):
-    params = urllib.parse.urlencode({
-        "query": query.strip(),
-        "project_type": project_type,
-        "user_id": user_id,
-        "max_charts": max_charts,
-        "thread_id": st.session_state.thread_id,
-    })
-    sse_url = f"{API_BASE}/report/stream?{params}"
-
-    progress = st.progress(0.0, text="Starting...")
-    status = st.empty()
-    result_payload = None
-    query_id = None
-
-    try:
-        # The ONE place we bypass the typed `api` client: SSE is a long-lived
-        # streaming response, not a JSON request/response. Progress events are
-        # surfaced to the user via the streamlit progress bar below, so this
-        # call doesn't need to appear in the API-trace panel.
-        resp = requests.get(sse_url, stream=True, timeout=600)
-        if resp.status_code != 200:
-            progress.empty()
-            st.error(f"API error ({resp.status_code}): {resp.text[:200]}")
             return
-        current_event = None
-        for line in resp.iter_lines(decode_unicode=True):
-            if not line or line.startswith(":"):
-                continue
-            if line.startswith("event: "):
-                current_event = line[7:]
-                continue
-            if line.startswith("data: "):
-                data = json.loads(line[6:])
-                if current_event == "stream_started":
-                    query_id = data.get("query_id")
-                    status.info(f"Query started (ID: {query_id[:8] if query_id else '?'}…)")
-                elif current_event == "step":
-                    step = data.get("step", 0)
-                    total = data.get("total", 3)
-                    progress.progress(min(step / (total + 1), 0.99), text=data.get("label", "..."))
-                elif current_event == "retrieval_done":
-                    status.info(f"Retrieval: {data.get('nodes', 0)} nodes · {data.get('paths', 0)} paths "
-                                f"({data.get('elapsed_ms', 0):.0f}ms)")
-                elif current_event == "traversal_done":
-                    status.success(f"Traversal: {data.get('steps', 0)} tool call(s) in "
-                                   f"{data.get('elapsed_ms', 0)/1000:.1f}s")
-                elif current_event == "complete":
-                    result_payload = data
-                elif current_event == "error":
-                    progress.empty()
-                    status.error(f"Error: {data.get('message', 'Unknown error')}")
-                    return
-
-        if not result_payload:
-            progress.empty()
-            status.warning("Stream ended without a result.")
+        with st.spinner("Patching the chart…"):
+            s_, body, err = api_chart_edit(chart_id, instr.strip())
+        if err:
+            st.error(f"Edit failed — {err}")
             return
-
-        progress.progress(1.0, text="Complete")
-        status.empty()
-        # SSE complete payload is slim now: just charts + rationale + errors.
-        # Each chart already carries chart_id + script + insight + colors etc.
-        st.session_state.queries.append({
-            "query_id":     query_id or str(uuid.uuid4()),
-            "query":        query.strip(),
-            "project_type": project_type,
-            "charts":       result_payload.get("charts", []),
-            "rationale":    result_payload.get("rationale", ""),
-        })
-
-    except requests.exceptions.ConnectionError:
-        progress.empty()
-        st.error("Could not connect to the API. Start the server with `uvicorn app.main:app --port 8002`.")
-    except Exception as e:
-        progress.empty()
-        st.error(f"Error: {e}")
+        st.success("Edit applied + persisted")
+        st.rerun()
 
 
-# ── Chart card (rendered in the chat column) ────────────────────────────────
+# ── Page tabs ───────────────────────────────────────────────────────────────
 
-def _add_chart_to_draft_by_id(draft_id: str, q_rec: dict, chart_idx: int):
-    """Fetch the latest draft state, append a slot, PATCH back."""
-    target = next((d for d in drafts if d["draft_id"] == draft_id), None)
-    if target is None:
-        return False, "Draft not found."
-    return _add_chart_to_draft(target, q_rec, chart_idx)
-
-
-def _render_chart_card(q_rec: dict, chart: dict, idx: int, active_draft: dict | None):
-    title = "Chart"
-    if isinstance(chart.get("title"), dict):
-        title = chart["title"].get("text", f"Chart {idx+1}")
-    elif isinstance(chart.get("title"), str):
-        title = chart["title"]
-
-    st.markdown(f"**{idx+1}. {title}**")
-    description = chart.get("description", "")
-    if description:
-        st.caption(description)
-
-    render_highchart(chart, container_key=f"{q_rec['query_id']}-{idx}")
-
-    render_insight(chart.get("insight"))
-
-    # Script is now a top-level field on the chart object itself.
-    code = chart.get("script") or "(no script captured)"
-    with st.expander("🐍 Python + SQL script"):
-        st.code(code, language="python")
-    # Legacy evidence rows blob — only show if it happens to be present
-    # (not in the slim SSE response, but old session caches may carry it).
-    ev = chart.get("evidence") or {}
-    with st.expander("🗂 Evidence — data used"):
-        result = ev.get("result")
-        if isinstance(result, (dict, list)):
-            st.json(result)
-        elif result:
-            st.code(str(result))
-        else:
-            st.caption("No data payload captured.")
-
-    source_key = f"{q_rec['query_id']}:{idx}"
-    in_drafts = [d for d in drafts if _chart_in_draft(d, source_key)]
-    popover_label = (
-        f"✓ In {len(in_drafts)} draft{'s' if len(in_drafts) != 1 else ''}"
-        if in_drafts else "➕ Add to canvas"
-    )
-
-    # Chat-side action: only "Add to canvas". Editing a chart lives in the
-    # Report canvas tab — pick the chart there, click ✏️ Edit. This keeps
-    # the chat read-only and stops two parallel edit surfaces from competing.
-    with st.popover(popover_label, use_container_width=True):
-        st.markdown("**Add this chart to a draft report**")
-
-        if drafts:
-            st.caption("Pick an existing draft:")
-            for d in drafts:
-                did = d["draft_id"]
-                n_slots = len(d.get("slots") or [])
-                already = _chart_in_draft(d, source_key)
-                full = n_slots >= MAX_REPORT_CHARTS and not already
-                if already:
-                    btn = f"✓ 📄 {d.get('name') or 'Untitled'} ({n_slots}/{MAX_REPORT_CHARTS})"
-                elif full:
-                    btn = f"⛔ 📄 {d.get('name') or 'Untitled'} (full)"
-                else:
-                    btn = f"📄 {d.get('name') or 'Untitled'} ({n_slots}/{MAX_REPORT_CHARTS})"
-                if st.button(
-                    btn,
-                    key=f"addto_{q_rec['query_id']}_{idx}_{did}",
-                    disabled=already or full,
-                    use_container_width=True,
-                ):
-                    ok, msg = _add_chart_to_draft_by_id(did, q_rec, idx)
-                    st.toast(msg, icon="✅" if ok else "⚠️")
-                    if ok:
-                        st.session_state.active_draft_id = did
-                        st.rerun()
-            st.divider()
-
-        st.caption("…or start a new draft report:")
-        new_name = st.text_input(
-            "New draft name",
-            placeholder="e.g., Q2 Power Rollout Status",
-            key=f"newdraft_{q_rec['query_id']}_{idx}",
-            label_visibility="collapsed",
-        )
-        if st.button(
-            "➕ Create new draft & add",
-            key=f"newbtn_{q_rec['query_id']}_{idx}",
-            type="primary",
-            use_container_width=True,
-        ):
-            if not new_name.strip():
-                st.warning("Give the new draft a name first.")
-            else:
-                row = api_create_draft(user_id, new_name.strip(), project_type)
-                if row:
-                    ok, msg = _add_chart_to_draft(row, q_rec, idx)
-                    st.session_state.active_draft_id = row["draft_id"]
-                    st.toast(
-                        f"Created “{new_name.strip()}” and added the chart." if ok else msg,
-                        icon="✅" if ok else "⚠️",
-                    )
-                    st.rerun()
+tab_chat, tab_canvas, tab_templates, tab_explore, tab_trace = st.tabs([
+    f"💬 Chat ({len(st.session_state.queries)})",
+    f"🎨 Canvas ({len(drafts)})",
+    "📄 Templates",
+    "🔍 Explore (charts / edit history)",
+    "🛠 API trace",
+])
 
 
-# ── LEFT (chat) · RIGHT (canvas) layout ────────────────────────────────────
-
-active_draft = next((d for d in drafts if d["draft_id"] == st.session_state.active_draft_id), None)
-
-col_chat, col_canvas = st.columns([3, 2], gap="large")
-
-
-# ── LEFT: Chat column ───────────────────────────────────────────────────────
-
-with col_chat:
-    st.subheader("💬 Chat")
+# ============================================================================
+# CHAT TAB — SSE stream + history rendering
+# ============================================================================
+with tab_chat:
+    st.subheader("Conversation")
 
     if not st.session_state.queries:
-        st.info("Ask a question below to get started.")
+        st.info("Ask a question below to start a new thread.")
 
     for q_rec in st.session_state.queries:
         with st.container(border=True):
-            st.markdown(f"**You:** {q_rec['query']}")
+            st.markdown(f"**👤 You:** {q_rec.get('query') or ''}")
             if q_rec.get("rationale"):
-                st.info(f"**AI:** {q_rec['rationale']}")
+                st.info(f"**🤖 AI:** {q_rec['rationale']}")
             charts = q_rec.get("charts") or []
             if not charts:
-                st.warning("No charts were produced for this query.")
+                st.warning("No charts produced for this question.")
             for i, chart in enumerate(charts):
                 with st.container(border=True):
-                    _render_chart_card(q_rec, chart, i, active_draft)
+                    title = (chart.get("title") or {}).get("text") if isinstance(chart.get("title"), dict) else "Chart"
+                    st.markdown(f"**{i+1}. {title}**")
+                    if chart.get("description"):
+                        st.caption(chart["description"])
+                    render_chart(chart, container_key=f"{q_rec['query_id']}-{i}")
+                    if chart.get("insight"):
+                        st.success(f"💡 **Insight:** {chart['insight']}")
+                    with st.expander("🐍 Python + SQL script", expanded=False):
+                        st.code(chart.get("script") or "(no script)", language="python")
+
+                    # "Add to canvas" popover
+                    cid = chart.get("chart_id") or ""
+                    in_drafts = [d for d in drafts if _chart_in_draft(d, cid)]
+                    label = f"✓ In {len(in_drafts)} draft(s)" if in_drafts else "➕ Add to canvas"
+                    with st.popover(label, use_container_width=True):
+                        if drafts:
+                            for d in drafts:
+                                already = _chart_in_draft(d, cid)
+                                full = (len(d.get("slots") or []) >= MAX_REPORT_CHARTS) and not already
+                                btn = ("✓ " if already else ("⛔ " if full else "📄 ")) + (d.get("name") or "Untitled") + f" ({len(d.get('slots') or [])}/{MAX_REPORT_CHARTS})"
+                                if st.button(btn, key=f"addto_{q_rec['query_id']}_{i}_{d['draft_id']}",
+                                             disabled=already or full, use_container_width=True):
+                                    ok, msg = _add_chart_to_draft(d, chart)
+                                    st.toast(msg, icon="✅" if ok else "⚠️")
+                                    if ok:
+                                        st.session_state.active_draft_id = d["draft_id"]
+                                        st.rerun()
+                            st.divider()
+                        new_name = st.text_input("New draft name", key=f"newdraft_{q_rec['query_id']}_{i}",
+                                                  placeholder="e.g. Q2 Run-Rate Report",
+                                                  label_visibility="collapsed")
+                        if st.button("➕ Create draft & add", key=f"newbtn_{q_rec['query_id']}_{i}",
+                                     type="primary", use_container_width=True):
+                            if not new_name.strip():
+                                st.warning("Give the draft a name.")
+                            else:
+                                s_, body, err = api_create_draft(user_id, new_name.strip(), project_type)
+                                if err:
+                                    st.error(err)
+                                else:
+                                    ok, msg = _add_chart_to_draft(body, chart)
+                                    st.session_state.active_draft_id = body["draft_id"]
+                                    st.toast(f"Created “{new_name.strip()}” + added" if ok else msg,
+                                             icon="✅" if ok else "⚠️")
+                                    st.rerun()
 
     st.divider()
     with st.form("chat_form", clear_on_submit=True):
-        new_q = st.text_area(
-            "Ask another question",
-            placeholder="e.g., What is the site completion rate by market for NTM projects?",
-            height=80,
-        )
+        new_q = st.text_area("Ask a question",
+                              placeholder="e.g. Give the GC run rate region wise",
+                              height=80)
         submitted = st.form_submit_button("Generate", type="primary")
-    if submitted and new_q.strip():
-        _run_query(new_q)
-        st.rerun()
-    elif submitted:
-        st.warning("Please enter a question.")
 
-
-# ── RIGHT: Canvas + Templates tabs ──────────────────────────────────────────
-
-with col_canvas:
-    # The list endpoint returns just {template_id, title} per row.
-    # Each template card we want to display is hydrated via
-    # GET /templates/{id}?user_id=... (ownership-checked, full state).
-    try:
-        _meta_tpls = api.list_templates(user_id)   # list[dict] — id+title
-        templates_for_right = []
-        for t in _meta_tpls:
-            tid = t["template_id"]
+    if submitted:
+        if not new_q.strip():
+            st.warning("Please enter a question.")
+        else:
+            params = urllib.parse.urlencode({
+                "query": new_q.strip(), "project_type": project_type,
+                "user_id": user_id, "max_charts": max_charts,
+                "thread_id": st.session_state.thread_id,
+            })
+            sse_url = f"{API_BASE}/report/stream?{params}"
+            progress = st.progress(0.0, text="Starting…")
+            status   = st.empty()
+            result   = None
+            qid      = None
             try:
-                templates_for_right.append(api.get_template(tid, user_id=user_id).model_dump())
-            except (ApiError, requests.RequestException):
-                # Fall back to id+title only so the rest of the list still renders.
-                templates_for_right.append({**t, "selections": []})
-    except (ApiError, requests.RequestException):
-        templates_for_right = []
-
-    tab_canvas_pane, tab_templates_pane = st.tabs([
-        f"🎨 Canvas ({len(drafts)})",
-        f"📄 Templates ({len(templates_for_right)})",
-    ])
+                resp = requests.get(sse_url, stream=True, timeout=600)
+                if resp.status_code != 200:
+                    st.error(f"SSE error {resp.status_code}: {resp.text[:200]}")
+                else:
+                    cur = None
+                    for line in resp.iter_lines(decode_unicode=True):
+                        if not line or line.startswith(":"): continue
+                        if line.startswith("event: "):
+                            cur = line[7:]
+                        elif line.startswith("data: "):
+                            data = json.loads(line[6:])
+                            if cur == "stream_started":
+                                qid = data.get("query_id")
+                                status.info(f"query_id = {qid[:8]}…")
+                            elif cur == "step":
+                                progress.progress(min(data.get("step",0)/(data.get("total",3)+1), 0.99),
+                                                  text=data.get("label","…"))
+                            elif cur == "retrieval_done":
+                                status.info(f"Retrieval: {data.get('nodes',0)} nodes / {data.get('paths',0)} paths in {data.get('elapsed_ms',0):.0f}ms")
+                            elif cur == "traversal_done":
+                                status.info(f"Traversal: {data.get('steps',0)} step(s) in {data.get('elapsed_ms',0)/1000:.1f}s")
+                            elif cur == "complete":
+                                result = data
+                            elif cur == "error":
+                                progress.empty()
+                                st.error(f"Error: {data.get('message')}")
+                                break
+                    if result:
+                        progress.progress(1.0, text="Complete")
+                        status.empty()
+                        st.session_state.queries.append({
+                            "query_id":  qid or str(uuid.uuid4()),
+                            "query":     new_q.strip(),
+                            "rationale": result.get("rationale",""),
+                            "charts":    result.get("charts", []),
+                        })
+                        st.rerun()
+            except requests.RequestException as e:
+                st.error(f"Network error: {e}")
 
 
 # ============================================================================
-# CANVAS TAB
+# CANVAS TAB — drafts list, create, free-form drag/drop, edit, save, download
 # ============================================================================
-with tab_canvas_pane:
-    st.subheader("🎨 Report canvas")
-
-    # ── Card-style list of all drafts at the top ──────────────────────────
-    list_col, new_col = st.columns([4, 1])
-    with new_col:
+with tab_canvas:
+    top, top_btn = st.columns([4, 1])
+    with top_btn:
         with st.popover("➕ New draft", use_container_width=True):
-            new_name = st.text_input("Draft name",
-                                     placeholder="e.g., Q2 Power Rollout Status",
-                                     key="_new_draft_name")
+            nd_name = st.text_input("Draft name", key="_new_draft_name",
+                                     placeholder="e.g. Q2 NTM Run-Rate Report")
             if st.button("Create", type="primary", use_container_width=True):
-                if not new_name.strip():
+                if not nd_name.strip():
                     st.warning("Give the draft a name.")
                 else:
-                    row = api_create_draft(user_id, new_name.strip(), project_type)
-                    if row:
-                        st.session_state.active_draft_id = row["draft_id"]
-                        st.toast(f"Created “{new_name.strip()}”", icon="✅")
+                    s_, body, err = api_create_draft(user_id, nd_name.strip(), project_type)
+                    if err: st.error(err)
+                    else:
+                        st.session_state.active_draft_id = body["draft_id"]
                         st.rerun()
-    with list_col:
-        st.caption(f"📚 **My canvases** · {len(drafts)} total"
-                   "  ·  📄 = this thread  ·  🧵 = from another thread")
+    with top:
+        st.subheader(f"📚 My canvases · {len(drafts)}")
 
     if drafts:
-        # Render each draft as a clickable card row.
         for d in drafts:
             did = d["draft_id"]
             is_active = (did == st.session_state.active_draft_id)
             n_slots = len(d.get("slots") or [])
             updated = str(d.get("updated_at") or "")[:19]
-
-            border_color = "#2563eb" if is_active else "#e5e7eb"
-            bg = "rgba(37, 99, 235, 0.06)" if is_active else "transparent"
-            with st.container(border=False):
-                st.markdown(
-                    f"<div style='padding:10px 12px;border:1px solid {border_color};"
-                    f"border-radius:8px;background:{bg};margin-bottom:6px;"
-                    f"display:flex;align-items:center;justify-content:space-between;'>"
-                    f"<div><b>📄 {(d.get('name') or 'Untitled')}</b>"
-                    f"  <span style='color:#6b7280;font-size:0.85em;'>"
-                    f"· {n_slots}/{MAX_REPORT_CHARTS} charts · updated {updated}</span></div>"
-                    f"</div>",
-                    unsafe_allow_html=True,
-                )
-                col_open, col_del = st.columns([5, 1])
-                with col_open:
-                    if not is_active:
-                        if st.button(f"Open “{(d.get('name') or 'Untitled')[:30]}”",
-                                     key=f"open_draft_{did}", use_container_width=True):
-                            st.session_state.active_draft_id = did
-                            st.rerun()
-                    else:
-                        st.caption("✅ Currently editing this canvas below.")
-                with col_del:
-                    pk = f"_draft_card_del_{did}"
-                    if st.session_state.get(pk):
-                        if st.button("✓", key=f"draft_card_del_ok_{did}",
-                                     use_container_width=True, help="Confirm delete"):
-                            api_delete_draft(did)
-                            st.session_state.pop(pk, None)
-                            if st.session_state.active_draft_id == did:
-                                st.session_state.active_draft_id = None
-                            st.toast("Draft deleted.", icon="🗑️")
-                            st.rerun()
-                    else:
-                        if st.button("🗑", key=f"draft_card_del_{did}",
-                                     use_container_width=True,
-                                     help="Delete this draft (click again to confirm)"):
-                            st.session_state[pk] = True
-                            st.rerun()
+            color = "#2563eb" if is_active else "#e5e7eb"
+            bg = "rgba(37,99,235,.06)" if is_active else "transparent"
+            st.markdown(
+                f"<div style='padding:10px 12px;border:1px solid {color};border-radius:8px;background:{bg};margin-bottom:6px;'>"
+                f"<b>📄 {(d.get('name') or 'Untitled')}</b>"
+                f"&nbsp;&nbsp;<span style='color:#6b7280;font-size:.85em;'>· {n_slots}/{MAX_REPORT_CHARTS} charts · updated {updated}</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+            ca, cb = st.columns([5, 1])
+            with ca:
+                if not is_active:
+                    if st.button(f"Open “{(d.get('name') or 'Untitled')[:30]}”",
+                                 key=f"open_d_{did}", use_container_width=True):
+                        st.session_state.active_draft_id = did
+                        st.rerun()
+                else:
+                    st.caption("✅ Currently editing this canvas below")
+            with cb:
+                pk = f"_del_pending_{did}"
+                if st.session_state.get(pk):
+                    if st.button("✓ confirm", key=f"del_ok_{did}", use_container_width=True):
+                        api_delete_draft(did)
+                        st.session_state.pop(pk, None)
+                        if st.session_state.active_draft_id == did:
+                            st.session_state.active_draft_id = None
+                        st.rerun()
+                else:
+                    if st.button("🗑", key=f"del_{did}", use_container_width=True, help="Delete (click again to confirm)"):
+                        st.session_state[pk] = True
+                        st.rerun()
     else:
-        st.info("No canvas drafts yet. Use **➕ New draft** above, or click "
-                "**Add to canvas** under any chart in the chat.")
+        st.info("No canvas drafts yet. Use **➕ New draft** above, or **Add to canvas** under any chart in the chat.")
 
     st.divider()
 
-    # Refetch the active draft from the just-fetched drafts list
-    active_draft = next((d for d in drafts if d["draft_id"] == st.session_state.active_draft_id), None)
-
-    if not active_draft:
-        with st.container(border=True):
-            st.caption("Pick a draft above, or click **➕ New draft** to start one.")
-    else:
-        # Rename + delete controls
-        rname_col, rdel_col = st.columns([4, 1])
-        with rname_col:
-            renamed = st.text_input("Draft name", value=active_draft.get("name") or "",
-                                    key=f"rename_{active_draft['draft_id']}",
-                                    label_visibility="collapsed")
-            if renamed.strip() and renamed.strip() != active_draft.get("name"):
-                api_patch_draft(active_draft["draft_id"], name=renamed.strip())
+    # Active draft editor
+    active = next((d for d in drafts if d["draft_id"] == st.session_state.active_draft_id), None)
+    if active:
+        c1, c2 = st.columns([4, 1])
+        with c1:
+            renamed = st.text_input("Draft name", value=active.get("name") or "",
+                                     key=f"rename_{active['draft_id']}", label_visibility="collapsed")
+            if renamed.strip() and renamed.strip() != active.get("name"):
+                api_patch_draft(active["draft_id"], name=renamed.strip())
                 st.rerun()
-        with rdel_col:
-            del_key = f"_draft_del_pending_{active_draft['draft_id']}"
-            if st.session_state.get(del_key):
-                if st.button("✓ Del", key=f"draft_del_ok_{active_draft['draft_id']}",
-                             use_container_width=True):
-                    api_delete_draft(active_draft["draft_id"])
-                    st.session_state.pop(del_key, None)
-                    st.session_state.active_draft_id = None
-                    st.toast("Draft deleted.", icon="🗑️")
-                    st.rerun()
-            else:
-                if st.button("🗑", key=f"draft_del_{active_draft['draft_id']}",
-                             use_container_width=True, help="Delete this draft"):
-                    st.session_state[del_key] = True
-                    st.rerun()
+        with c2:
+            if st.button("🗑 Delete this draft", key=f"del_act_{active['draft_id']}", use_container_width=True):
+                api_delete_draft(active["draft_id"])
+                st.session_state.active_draft_id = None
+                st.rerun()
 
-        slots = active_draft.get("slots") or []
-        if isinstance(slots, str):
-            try:
-                slots = json.loads(slots)
-            except Exception:
-                slots = []
-        slots = sorted(slots, key=lambda s: int(s.get("position", 0)))
-        for i, s in enumerate(slots):
-            s["position"] = i
+        slots = sorted(
+            active.get("slots") or [],
+            key=lambda s: (float(s.get("y", 0) or 0), float(s.get("x", 0) or 0)),
+        )
+        st.caption(f"**{len(slots)}/{MAX_REPORT_CHARTS}** chart(s) in **“{active.get('name')}”** · "
+                   "drag tiles to move, drag corners to resize · positions auto-save")
 
-        st.caption(f"**{len(slots)} / {MAX_REPORT_CHARTS}** charts in **“{active_draft.get('name')}”**"
-                   "  ·  _drag tiles with the mouse to reposition, drag a tile edge to resize. "
-                   "Every move is saved instantly._")
-
-        # 2D canvas — each chart is a draggable, resizable tile.
         if slots:
-            render_gridstack_canvas(
-                slots=slots,
-                draft_id=active_draft["draft_id"],
-                api_base=API_BASE,
-                height=max(420, 80 * max([int(s.get("y", 0)) + int(s.get("h", 4))
-                                          for s in slots], default=6) + 80),
-            )
-            if st.button("🔄 Pull latest layout from DB",
-                         key=f"sync_layout_{active_draft['draft_id']}",
-                         use_container_width=True,
-                         help="After dragging tiles around, click this to refresh the rest of the page."):
+            render_freeform_canvas(slots, active["draft_id"])
+            if st.button("🔄 Refresh layout from server",
+                         key=f"sync_{active['draft_id']}", use_container_width=True):
                 st.rerun()
-
-        if not slots:
-            st.info("Canvas is empty. Use **➕ Add to canvas** under any chart in the chat — "
-                    "each new chart lands in the first free grid spot. After that, drag and "
-                    "resize tiles here to arrange the page.")
         else:
-            # ── Quick edit — select a canvas tile and patch it in-place ────
-            # Edits flow through POST /charts/edit which updates the chart in
-            # reporting_agent_queries.charts[idx] and propagates back into
-            # every draft + linked template that holds this chart.
-            sorted_slots = sorted(slots, key=lambda x: (int(x.get("y", 0)), int(x.get("x", 0))))
-            # chart_id is the only handle the chart-edit API takes now.
-            slot_titles: dict[str, str] = {}
-            for s in sorted_slots:
-                cid = _slot_chart_id(s)
-                if not cid:
-                    continue
-                ch = s.get("chart") or {}
-                title_obj = ch.get("title")
-                t = (title_obj.get("text") if isinstance(title_obj, dict) else title_obj) or "Chart"
-                slot_titles[cid] = t
+            st.info("Canvas is empty. Use **➕ Add to canvas** under any chart in the chat.")
 
+        # Edit a slot's chart via NL
+        if slots:
             with st.container(border=True):
-                st.markdown("##### ✏️ Edit a chart on the canvas")
-                ed_sel, ed_btn = st.columns([4, 1])
-                with ed_sel:
-                    cid_options = list(slot_titles.keys())
-                    picked_cid = st.selectbox(
-                        "Which chart?",
-                        options=cid_options,
-                        format_func=lambda cid: f"{slot_titles[cid]}",
-                        key=f"edit_slot_pick_{active_draft['draft_id']}",
-                        label_visibility="collapsed",
-                    )
-                with ed_btn:
-                    if st.button("✏️ Edit chart",
-                                 key=f"edit_slot_btn_{active_draft['draft_id']}",
-                                 use_container_width=True,
-                                 help="Open the natural-language edit dialog for the picked chart"):
-                        if picked_cid:
-                            _edit_chart_dialog(picked_cid, slot_titles[picked_cid])
+                st.markdown("##### ✏️ Edit a slot's chart (NL)")
+                opts = [(_slot_chart_id(s),
+                         (s.get("chart") or {}).get("title", {}).get("text", "(untitled)")) for s in slots]
+                e1, e2 = st.columns([4, 1])
+                with e1:
+                    pick = st.selectbox("Which chart?", options=[o[0] for o in opts],
+                                        format_func=lambda c: dict(opts).get(c, c),
+                                        key=f"edit_pick_{active['draft_id']}",
+                                        label_visibility="collapsed")
+                with e2:
+                    if st.button("✏️ Edit", key=f"edit_btn_{active['draft_id']}", use_container_width=True):
+                        if pick: _edit_chart_dialog(pick, dict(opts).get(pick, "Chart"))
 
-                st.caption("_Changes also update the same chart in the chat and in any finalized "
-                           "template linked to this canvas._")
-
-            # ── Per-tile details panel with inline edit buttons ───────────
-            with st.expander("📋 Slot details (insight · script · edit)"):
-                for s in sorted_slots:
-                    cid = _slot_chart_id(s)
-                    title = slot_titles.get(cid, "Chart")
-                    cols_hdr, cols_edit = st.columns([5, 1])
-                    with cols_hdr:
-                        st.markdown(
-                            f"**[{s.get('x', 0)},{s.get('y', 0)}] "
-                            f"{s.get('w', '?')}×{s.get('h', '?')}** · {title}"
-                        )
-                    with cols_edit:
-                        if cid and st.button(
-                            "✏️ Edit",
-                            key=f"edit_slot_inline_{active_draft['draft_id']}_{cid}",
-                            use_container_width=True,
-                        ):
-                            _edit_chart_dialog(cid, title)
-                    slot_insight = (s.get("chart") or {}).get("insight")
-                    if slot_insight:
-                        render_insight(slot_insight, header="💡 Insight")
-                    # Script is now inside chart, not a separate `evidence` field.
-                    script = (s.get("chart") or {}).get("script") or "(no script)"
-                    st.code(script, language="python")
-                    # Show edit history (if any) so the user sees what's been
-                    # applied to this chart over time.
-                    history = (s.get("chart") or {}).get("_edit_history") or []
-                    if history:
-                        st.caption(
-                            f"Edits applied: {', '.join((h.get('instruction') or '')[:50] for h in history[-3:])}"
-                            + (" …" if len(history) > 3 else "")
-                        )
-                    st.divider()
-
+        # Downloads + finalize
         st.divider()
-        # Finalize — upserts by source_draft_id. If a template was already
-        # finalized from this canvas, the existing template is updated in
-        # place (title + selections) so we don't accumulate duplicates
-        # every time the user clicks Finalize.
-        existing_tpl_for_draft = next(
-            (t for t in templates_for_right
-             if t.get("source_draft_id") == active_draft["draft_id"]),
-            None,
-        )
-        finalize_label = (
-            f"💾 Update existing report: “{(existing_tpl_for_draft.get('title') or 'Untitled')[:30]}”"
-            if existing_tpl_for_draft else "🆕 Finalize as new template"
-        )
-        default_title = (
-            existing_tpl_for_draft.get("title") if existing_tpl_for_draft
-            else (active_draft.get("name") or "")
-        )
-        with st.form(f"finalize_{active_draft['draft_id']}"):
-            ftitle = st.text_input("Report title", value=default_title)
-            finalize = st.form_submit_button(
-                finalize_label,
-                type="primary", use_container_width=True,
-                disabled=not slots,
+        cols = st.columns([2, 2, 2, 3])
+        with cols[0]:
+            st.markdown("**Export**")
+        with cols[1]:
+            url_html = f"{API_BASE}/canvas/drafts/{active['draft_id']}/download?user_id={urllib.parse.quote(user_id)}"
+            st.markdown(f"[⬇ HTML]({url_html})", help="Self-contained Highcharts page")
+        with cols[2]:
+            url_pdf = f"{API_BASE}/canvas/drafts/{active['draft_id']}/download.pdf?user_id={urllib.parse.quote(user_id)}"
+            st.markdown(f"[⬇ PDF]({url_pdf})", help="Server-rendered PDF (Markdown intermediate)")
+        with cols[3]:
+            existing_tpl = next(
+                (None for _ in [None]),  # placeholder; we look it up via templates list below
+                None,
             )
-        if finalize:
-            # New API: just send {user_id, draft_id, title, project_type}.
-            # The server pulls slots from the draft and copies them as the
-            # template's selections by chart_id reference — no chart payload
-            # duplication.
-            try:
-                action_resp = api.upsert_template(
-                    user_id=user_id,
-                    draft_id=active_draft["draft_id"],
-                    title=ftitle,
-                    project_type=project_type,
-                )
-                st.success(
-                    f"Template **{action_resp.action}**. Open the **📄 Templates** tab to view it."
-                )
-                st.session_state.template_view = action_resp.template_id
+
+        # Finalize as template (auto-upserts by source_draft_id server-side)
+        with st.form(f"finalize_{active['draft_id']}"):
+            ftitle = st.text_input("Template title", value=active.get("name") or "")
+            do_finalize = st.form_submit_button("💾 Save as template (upsert)",
+                                                 type="primary", use_container_width=True,
+                                                 disabled=not slots)
+        if do_finalize:
+            s_, body, err = api_create_template(
+                user_id=user_id, draft_id=active["draft_id"],
+                title=ftitle.strip() or None, project_type=project_type,
+            )
+            if err:
+                st.error(err)
+            else:
+                st.success(f"Template **{body.get('action')}** · `{body.get('template_id')[:8]}…`")
+                st.session_state.template_view = body.get("template_id")
                 st.rerun()
-            except ApiError as e:
-                _show_api_error("Save template", e)
-            except requests.RequestException as e:
-                st.error(f"Save failed: {e}")
+    else:
+        st.caption("Pick a draft above, or click **➕ New draft** to start one.")
 
 
 # ============================================================================
-# TEMPLATES TAB
+# TEMPLATES TAB — list, open, re-run, download, delete
 # ============================================================================
-with tab_templates_pane:
-    st.subheader("📄 Saved templates")
+with tab_templates:
+    s_, body, err = api_list_templates(user_id)
+    tpls = (body or {}).get("templates") or []
 
-    tpls = templates_for_right  # already fetched above for the tab badge
+    st.subheader(f"📄 Saved templates · {len(tpls)}")
 
     if not tpls:
-        st.info("You haven't saved any templates yet. Build a canvas, click **Finalize**, and it lands here.")
+        st.info("No saved templates yet. Build a canvas → click **Save as template** to get one here.")
     else:
-        # Resolve which template is currently focused.
-        tid = st.session_state.template_view
-        valid_tids = {t["template_id"] for t in tpls}
-        if tid and tid not in valid_tids:
-            tid = None
-            st.session_state.template_view = None
-        if not tid:
-            tid = tpls[0]["template_id"]
-            st.session_state.template_view = tid
-
-        st.caption(f"📚 **My templates** · {len(tpls)} total")
-
-        # ── Card list of templates ──────────────────────────────────────
+        # List of slim rows
         for t in tpls:
-            t_tid = t["template_id"]
-            is_open = (t_tid == tid)
-            sels = t.get("selections")
-            if isinstance(sels, str):
-                try:
-                    sels = json.loads(sels)
-                except Exception:
-                    sels = []
-            n_charts = len(sels or [])
-            t_title = t.get("title") or "Untitled"
-            t_proj = t.get("project_type") or "-"
-            t_created = str(t.get("created_at") or "")[:19]
-            t_last_run = str(t.get("last_run_at") or "")[:19] or "—"
-
-            border_color = "#16a34a" if is_open else "#e5e7eb"
-            bg = "rgba(22, 163, 74, 0.06)" if is_open else "transparent"
+            tid    = t["template_id"]
+            ttitle = t.get("title") or "Untitled"
+            is_open = (tid == st.session_state.template_view)
+            border = "#16a34a" if is_open else "#e5e7eb"
+            bg     = "rgba(22,163,74,.06)" if is_open else "transparent"
             st.markdown(
-                f"<div style='padding:10px 12px;border:1px solid {border_color};"
-                f"border-radius:8px;background:{bg};margin-bottom:6px;'>"
-                f"<div style='font-weight:600;'>📄 {t_title}</div>"
-                f"<div style='color:#6b7280;font-size:0.85em;margin-top:2px;'>"
-                f"{n_charts} chart{'s' if n_charts != 1 else ''} · "
-                f"project: <code>{t_proj}</code> · "
-                f"created: <code>{t_created}</code> · "
-                f"last run: <code>{t_last_run}</code>"
-                f"</div></div>",
+                f"<div style='padding:10px 12px;border:1px solid {border};border-radius:8px;background:{bg};margin-bottom:6px;'>"
+                f"<b>📄 {ttitle}</b>&nbsp;&nbsp;<span style='color:#6b7280;font-size:.85em;'>· `{tid[:8]}…`</span></div>",
                 unsafe_allow_html=True,
             )
-            col_open, col_run, col_del = st.columns([3, 2, 1])
-            with col_open:
+            ca, cb, cc, cd = st.columns([3, 2, 2, 1])
+            with ca:
                 if not is_open:
-                    if st.button(f"Open “{t_title[:30]}”",
-                                 key=f"tpl_card_open_{t_tid}", use_container_width=True):
-                        st.session_state.template_view = t_tid
+                    if st.button(f"Open “{ttitle[:28]}”", key=f"tpl_open_{tid}", use_container_width=True):
+                        st.session_state.template_view = tid
                         st.rerun()
                 else:
-                    st.caption("✅ Currently viewing this template below.")
-            with col_run:
-                if st.button("▶ Re-run", key=f"tpl_card_run_{t_tid}",
-                             type="primary", use_container_width=True):
+                    st.caption("✅ Open below")
+            with cb:
+                if st.button("▶ Re-run", key=f"tpl_run_{tid}", type="primary", use_container_width=True):
                     with st.spinner("Re-running scripts…"):
-                        try:
-                            run = api.run_template(t_tid)
-                            st.session_state[f"_rendered_{t_tid}"] = run.model_dump()
-                            st.session_state.template_view = t_tid
-                            st.toast("Refreshed.", icon="🔄")
-                            st.rerun()
-                        except ApiError as e:
-                            _show_api_error("Re-run", e)
-                        except requests.RequestException as e:
-                            st.error(f"Re-run failed: {e}")
-            with col_del:
-                pk = f"_tpl_card_del_{t_tid}"
+                        s_, body, err = api_run_template(tid)
+                    if err: st.error(err)
+                    else:
+                        st.session_state[f"_rerun_{tid}"] = body
+                        st.session_state.template_view = tid
+                        st.toast("Refreshed", icon="🔄")
+                        st.rerun()
+            with cc:
+                url_pdf = f"{API_BASE}/templates/{tid}/download.pdf?user_id={urllib.parse.quote(user_id)}"
+                st.markdown(f"[⬇ PDF]({url_pdf})", help="Re-runs server-side, returns fresh PDF")
+            with cd:
+                pk = f"_tpl_del_p_{tid}"
                 if st.session_state.get(pk):
-                    if st.button("✓", key=f"tpl_card_del_ok_{t_tid}",
-                                 use_container_width=True, help="Confirm delete"):
-                        try:
-                            api.delete_template(t_tid)
-                            st.session_state.pop(pk, None)
-                            st.session_state.pop(f"_rendered_{t_tid}", None)
-                            if st.session_state.template_view == t_tid:
-                                st.session_state.template_view = None
-                            st.toast("Template deleted.", icon="🗑️")
-                            st.rerun()
-                        except ApiError as e:
-                            st.session_state.pop(pk, None)
-                            _show_api_error("Delete template", e)
-                        except requests.RequestException as e:
-                            st.session_state.pop(pk, None)
-                            st.error(f"Delete failed: {e}")
+                    if st.button("✓", key=f"tpl_del_ok_{tid}", use_container_width=True):
+                        api_delete_template(tid)
+                        st.session_state.pop(pk, None)
+                        if st.session_state.template_view == tid:
+                            st.session_state.template_view = None
+                        st.rerun()
                 else:
-                    if st.button("🗑", key=f"tpl_card_del_{t_tid}",
-                                 use_container_width=True,
-                                 help="Delete (click again to confirm)"):
+                    if st.button("🗑", key=f"tpl_del_{tid}", use_container_width=True, help="Delete"):
                         st.session_state[pk] = True
                         st.rerun()
 
         st.divider()
 
-        # ── Render the currently-open template below the list ───────────
-        # `templates_for_right` already includes selections (we hydrated
-        # the list above), so no extra fetch needed for the open template.
-        meta: dict = next(
-            (t for t in templates_for_right if t.get("template_id") == tid),
-            {},
-        )
+        # Open one
+        view_tid = st.session_state.template_view or tpls[0]["template_id"]
+        st.session_state.template_view = view_tid
 
-        if meta:
-            st.markdown(f"### 📄 {meta.get('title', '')}")
+        s_, body, err = api_get_template(view_tid, user_id)
+        if err:
+            st.error(err)
+        else:
+            full = body or {}
+            st.markdown(f"### 📄 {full.get('title') or '(untitled)'}")
             st.caption(
-                f"project_type: `{meta.get('project_type') or '-'}` · "
-                f"created: `{meta.get('created_at', '')}` · "
-                f"last_run: `{meta.get('last_run_at', '')}`"
+                f"created `{str(full.get('created_at') or '')[:19]}` · "
+                f"last_run `{str(full.get('last_run_at') or '')[:19]}` · "
+                f"source_draft `{(full.get('source_draft_id') or '')[:8] if full.get('source_draft_id') else '(none)'}`"
             )
 
-            selections = sorted(
-                meta.get("selections") or [],
-                key=lambda s: int(s.get("position", 0)
-                                  if s.get("position") is not None
-                                  else 0),
-            )
-
-            # `last_rendered` cache was removed — show the saved canvas
-            # snapshot from `selections` by default. If the user just clicked
-            # "Re-run", `_rendered_{tid}` carries the freshly rebuilt
-            # SELECTIONS (each with its rebuilt chart) for this session.
-            rendered = st.session_state.get(f"_rendered_{tid}") or {}
-            rendered_selections = rendered.get("selections") or []
-            if rendered_selections:
-                # Sort the rerun result the same way we sort saved selections.
-                rendered_selections = sorted(
-                    rendered_selections,
-                    key=lambda s: int(s.get("position") if s.get("position") is not None else 0),
+            # Re-run output (if any in session) overrides the saved snapshot.
+            rerun = st.session_state.get(f"_rerun_{view_tid}") or {}
+            rendered_sels = rerun.get("selections") or []
+            if rendered_sels:
+                st.caption("🔄 Showing freshly re-run data")
+                slots_to_show = sorted(
+                    rendered_sels,
+                    key=lambda s: (float(s.get("y", 0) or 0), float(s.get("x", 0) or 0)),
                 )
-                # The rerun's selections take precedence over the saved snapshot
-                # — same layout, fresh chart contents.
-                selections = rendered_selections
-            charts_to_show = [s.get("chart") for s in selections if s.get("chart")]
+            else:
+                slots_to_show = sorted(
+                    full.get("selections") or [],
+                    key=lambda s: (float(s.get("y", 0) or 0), float(s.get("x", 0) or 0)),
+                )
 
-            reports = (rendered or {}).get("script_reports") or []
-            if reports:
-                oks = sum(1 for r in reports if r.get("status") == "success")
-                errs = len(reports) - oks
-                st.caption(f"Scripts: {oks} succeeded, {errs} failed")
-                with st.expander("Script run report"):
-                    for r in reports:
+            if rerun.get("script_reports"):
+                with st.expander("📋 Script reports"):
+                    for r in rerun["script_reports"]:
                         st.write(r)
 
-            if not charts_to_show:
-                st.warning("This template has no charts to render.")
+            if not slots_to_show:
+                st.warning("This template has no selections to render.")
             else:
-                # Render at saved x/y/w/h so the page reproduces the canvas layout.
-                layout_slots = []
-                for i, c in enumerate(charts_to_show):
-                    sel = selections[i] if i < len(selections) else {}
-                    x = int(sel.get("x", (i % 2) * 6) or 0)
-                    y = int(sel.get("y", (i // 2) * 4) or 0)
-                    w = int(sel.get("w", 6) or 6)
-                    h = int(sel.get("h", 4) or 4)
-                    layout_slots.append({"x": x, "y": y, "w": w, "h": h, "chart": c})
-                grid_height = max(420,
-                                  80 * max([s["y"] + s["h"] for s in layout_slots], default=6) + 80)
-                render_readonly_grid(
-                    slots=layout_slots,
-                    container_key=f"tpl-{tid}",
-                    height=grid_height,
-                )
-
-                with st.expander("📋 Chart details (description · insight · script)"):
-                    for i, chart in enumerate(charts_to_show):
-                        title = "Chart"
-                        if isinstance(chart.get("title"), dict):
-                            title = chart["title"].get("text", title)
-                        sel = selections[i] if i < len(selections) else {}
-                        st.markdown(
-                            f"**[{sel.get('x', 0)},{sel.get('y', 0)}] "
-                            f"{sel.get('w', '?')}×{sel.get('h', '?')}** · {title}"
-                        )
-                        if chart.get("description"):
-                            st.caption(chart["description"])
-                        ins = chart.get("insight") or (sel or {}).get("chart", {}).get("insight")
-                        if ins:
-                            header = ("💡 Insight (refreshed against today's data)"
-                                      if (chart.get("_insight_history") or [])
-                                      else "💡 Insight")
-                            render_insight(ins, header=header)
-                        # Script lives inside chart now (chart.script);
-                        # legacy evidence shape kept as a fallback.
-                        sel_chart = (sel or {}).get("chart") or {}
-                        script = sel_chart.get("script") or ((sel or {}).get("evidence") or {}).get("code") or "(no script)"
-                        st.markdown("**🐍 Python + SQL**")
-                        st.code(script, language="python")
+                render_readonly_grid(slots_to_show, container_key=f"tpl-{view_tid}")
+                with st.expander("📋 Per-chart details (insight + script)"):
+                    for sel in slots_to_show:
+                        ch = sel.get("chart") or {}
+                        title = (ch.get("title") or {}).get("text") if isinstance(ch.get("title"), dict) else "?"
+                        st.markdown(f"**[{sel.get('x'):.2f}, {sel.get('y'):.2f}] {sel.get('w'):.2f}×{sel.get('h'):.2f}** · {title}")
+                        if ch.get("insight"): st.success(ch["insight"])
+                        st.code(ch.get("script") or "(no script)", language="python")
                         st.divider()
+
+
+# ============================================================================
+# EXPLORE TAB — charts library + edit history
+# ============================================================================
+with tab_explore:
+    st.subheader("All charts for this user")
+    s_, body, err = api_charts_by_user(user_id)
+    rows = (body or {}).get("charts") or []
+    if err:
+        st.error(err)
+    elif not rows:
+        st.info("No charts saved yet for this user.")
+    else:
+        st.caption(f"{len(rows)} chart(s) — newest first")
+        for row in rows[:30]:
+            cid = row["chart_id"]
+            with st.expander(f"📊  {row.get('title_text') or '(untitled)'}  ·  type={row.get('chart_type')}  ·  `{cid[:8]}…`"):
+                meta_cols = st.columns(2)
+                with meta_cols[0]:
+                    st.caption(f"thread_id: `{(row.get('thread_id') or '')[:8]}…`")
+                    st.caption(f"query_id:  `{(row.get('query_id') or '')[:8]}…`")
+                with meta_cols[1]:
+                    st.caption(f"created: `{str(row.get('created_at') or '')[:19]}`")
+                    st.caption(f"updated: `{str(row.get('updated_at') or '')[:19]}`")
+                if row.get("chart"):
+                    render_chart(row["chart"], container_key=f"explore-{cid}", height=320)
+                if row.get("insight"):
+                    st.success(row["insight"])
+                # Edit history
+                with st.expander("📜 Edit history"):
+                    s_, hbody, herr = api_chart_edit_history(cid)
+                    edits = (hbody or {}).get("edits") or []
+                    if not edits:
+                        st.caption("_no edits yet_")
+                    else:
+                        for e in edits:
+                            st.write(f"`{str(e.get('created_at'))[:19]}` — _{e.get('instruction')}_")
+
+
+# ============================================================================
+# API TRACE TAB — every call made this session
+# ============================================================================
+with tab_trace:
+    trace = st.session_state.get("_api_trace") or []
+    cols = st.columns([4, 1])
+    with cols[0]:
+        st.caption(f"{len(trace)} call(s) recorded this session (newest first)")
+    with cols[1]:
+        if st.button("Clear", use_container_width=True):
+            st.session_state._api_trace = []
+            st.rerun()
+
+    for i, call in enumerate(trace[:80]):
+        bg = "#fef2f2" if (isinstance(call["status"], int) and call["status"] >= 400) else \
+             "#f0fdf4" if (isinstance(call["status"], int) and call["status"] < 300) else "#fffbeb"
+        head = f"{call['ts']}  ·  {call['method']:6}  {call['path']}  →  {call['status']}  ({call['elapsed_ms']}ms)"
+        with st.expander(head):
+            if call.get("params"):
+                st.markdown("**params:**"); st.json(call["params"])
+            if call.get("request"):
+                st.markdown("**request body:**"); st.json(call["request"])
+            st.markdown("**response:**")
+            if call.get("error"):
+                st.error(call["error"])
+            if isinstance(call["response"], (dict, list)):
+                st.json(call["response"])
+            elif call["response"]:
+                st.code(str(call["response"])[:2000])
